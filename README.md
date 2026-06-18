@@ -166,7 +166,10 @@ Available modes are:
   transient memory, and `--offload-outputs-to-cpu` moves returned tensors off GPU
   during inference. The JSON summary includes a `placement` object with parameter
   memory by class, estimated cached aggregator output size, and estimated output
-  tensor size.
+  tensor size. `--pipeline-head-parallel inter-frame` additionally shards
+  inter-frame SDPA by attention heads across the requested CUDA devices; this is
+  intended to test whether the remaining live all-frame attention workspace is
+  the limiting memory class after cache/input/output offload.
 - `compare`: runs `single` and `--compare-mode`, then reports finite
   diagnostics, shape, and drift for `pose_enc`, `depth`, `depth_conf`, and
   `camera_and_register_tokens`.
