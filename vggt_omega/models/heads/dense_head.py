@@ -103,8 +103,14 @@ class DenseHead(nn.Module):
                 frames_end_idx,
             )
             if self.output_device is not None:
-                depth_chunk = depth_chunk.to(device=self.output_device, non_blocking=True)
-                depth_conf_chunk = depth_conf_chunk.to(device=self.output_device, non_blocking=True)
+                depth_chunk = depth_chunk.to(
+                    device=self.output_device,
+                    non_blocking=self.output_device.type == "cuda",
+                )
+                depth_conf_chunk = depth_conf_chunk.to(
+                    device=self.output_device,
+                    non_blocking=self.output_device.type == "cuda",
+                )
             depth_chunks.append(depth_chunk)
             depth_conf_chunks.append(depth_conf_chunk)
 
@@ -168,8 +174,8 @@ class DenseHead(nn.Module):
             raise TypeError(f"DenseHead outputs must be fp32, got depth={depth.dtype}, conf={depth_conf.dtype}")
 
         if self.output_device is not None:
-            depth = depth.to(device=self.output_device, non_blocking=True)
-            depth_conf = depth_conf.to(device=self.output_device, non_blocking=True)
+            depth = depth.to(device=self.output_device, non_blocking=self.output_device.type == "cuda")
+            depth_conf = depth_conf.to(device=self.output_device, non_blocking=self.output_device.type == "cuda")
 
         return depth, depth_conf
 

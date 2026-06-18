@@ -161,7 +161,10 @@ class VGGTOmega(nn.Module):
 
         camera_and_register_tokens = final_tokens[:, :, :patch_token_start].contiguous()
         if self.output_device is not None:
-            camera_and_register_tokens = camera_and_register_tokens.to(device=self.output_device, non_blocking=True)
+            camera_and_register_tokens = camera_and_register_tokens.to(
+                device=self.output_device,
+                non_blocking=self.output_device.type == "cuda",
+            )
         predictions = {"camera_and_register_tokens": camera_and_register_tokens}
         with torch.autocast(device_type="cuda", enabled=False):
             if self.camera_head is not None:
@@ -170,7 +173,7 @@ class VGGTOmega(nn.Module):
                     patch_token_start=patch_token_start,
                 )
                 if self.output_device is not None:
-                    pose_enc = pose_enc.to(device=self.output_device, non_blocking=True)
+                    pose_enc = pose_enc.to(device=self.output_device, non_blocking=self.output_device.type == "cuda")
                 predictions["pose_enc"] = pose_enc
 
             if self.dense_head is not None:
@@ -192,7 +195,9 @@ class VGGTOmega(nn.Module):
 
         if not self.training:
             predictions["images"] = (
-                images.to(device=self.output_device, non_blocking=True) if self.output_device is not None else images
+                images.to(device=self.output_device, non_blocking=self.output_device.type == "cuda")
+                if self.output_device is not None
+                else images
             )
         return predictions
 

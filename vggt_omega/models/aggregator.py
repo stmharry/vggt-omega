@@ -230,7 +230,10 @@ class Aggregator(nn.Module):
             if block_idx in self.cached_layer_indices:
                 cached_tokens = torch.cat([frame_tokens, tokens], dim=-1)
                 if self.cache_device is not None:
-                    cached_tokens = cached_tokens.to(device=self.cache_device, non_blocking=True)
+                    cached_tokens = cached_tokens.to(
+                        device=self.cache_device,
+                        non_blocking=self.cache_device.type == "cuda",
+                    )
                 outputs.append(cached_tokens)
             else:
                 outputs.append(None)
