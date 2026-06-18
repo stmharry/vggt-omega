@@ -133,6 +133,9 @@ class SelfAttention(nn.Module):
             k = self.k_norm(k)
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
+        if getattr(self, "capture_qk", False):
+            self.last_q = q.detach()
+            self.last_k = k.detach()
         x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])

@@ -32,13 +32,17 @@ class VGGTOmega(nn.Module):
         self.dense_head = DenseHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_depth else None
         self.text_alignment_head = TextAlignmentHead(dim_in=2 * embed_dim) if enable_alignment else None
 
-    def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, images: torch.Tensor, return_motion: bool = False) -> dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
 
         amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         with torch.autocast(device_type="cuda", dtype=amp_dtype):
-            aggregated_tokens_list, patch_token_start = self.aggregator(images)
+            aggregation_result = self.aggregator(images, return_motion=return_motion)
+        if return_motion:
+            aggregated_tokens_list, patch_token_start, motion_features = aggregation_result
+        else:
+            aggregated_tokens_list, patch_token_start = aggregation_result
 
         final_tokens = aggregated_tokens_list[-1]
         if final_tokens is None:
@@ -47,6 +51,8 @@ class VGGTOmega(nn.Module):
         predictions = {
             "camera_and_register_tokens": final_tokens[:, :, :patch_token_start].contiguous(),
         }
+        if return_motion:
+            predictions["motion_features"] = motion_features
         with torch.autocast(device_type="cuda", enabled=False):
             if self.camera_head is not None:
                 predictions["pose_enc"] = self.camera_head(

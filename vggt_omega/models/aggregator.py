@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+from typing import Any
 
 from vggt_omega.models.layers import Mlp, RopePositionEmbedding, SelfAttentionBlock
 from vggt_omega.models.layers.vision_transformer import DinoVisionTransformer
@@ -100,7 +101,8 @@ class Aggregator(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
-    ) -> tuple[list[torch.Tensor | None], int]:
+        return_motion: bool = False,
+    ) -> tuple[list[torch.Tensor | None], int] | tuple[list[torch.Tensor | None], int, dict[str, Any]]:
         batch_size, num_frames, num_channels, height, width = images.shape
         if num_channels != 3:
             raise ValueError(f"Expected 3 input channels, got {num_channels}")
@@ -127,6 +129,9 @@ class Aggregator(nn.Module):
             )
 
         outputs = []
+        motion_q: list[torch.Tensor] = []
+        motion_k: list[torch.Tensor] = []
+        motion_layers: list[int] = []
         for block_idx in range(self.depth):
             tokens, frame_tokens = self._run_frame_block(
                 tokens,
@@ -145,12 +150,50 @@ class Aggregator(nn.Module):
                 embed_dim,
                 block_idx,
                 self.inter_frame_attention_types[block_idx],
+                return_motion=return_motion,
             )
+            if return_motion and self.inter_frame_attention_types[block_idx] == "global":
+                attn = self.inter_frame_blocks[block_idx].attn
+                q = getattr(attn, "last_q", None)
+                k = getattr(attn, "last_k", None)
+                if q is not None and k is not None:
+                    motion_q.append(
+                        self._patch_qk_tensor(
+                            q,
+                            batch_size,
+                            num_frames,
+                            num_tokens,
+                            embed_dim,
+                        ).cpu()
+                    )
+                    motion_k.append(
+                        self._patch_qk_tensor(
+                            k,
+                            batch_size,
+                            num_frames,
+                            num_tokens,
+                            embed_dim,
+                        ).cpu()
+                    )
+                    motion_layers.append(block_idx)
+                    del attn.last_q
+                    del attn.last_k
             if block_idx in self.cached_layer_indices:
                 outputs.append(torch.cat([frame_tokens, tokens], dim=-1))
             else:
                 outputs.append(None)
 
+        if return_motion:
+            motion_features: dict[str, Any] = {
+                "layer_indices": motion_layers,
+                "patch_grid_size": patch_grid_size,
+                "patch_token_start": self.patch_token_start,
+                "inter_frame_attention_types": list(self.inter_frame_attention_types),
+            }
+            if motion_q:
+                motion_features["global_tok_q"] = torch.stack(motion_q, dim=0)
+                motion_features["global_tok_k"] = torch.stack(motion_k, dim=0)
+            return outputs, self.patch_token_start, motion_features
         return outputs, self.patch_token_start
 
     def _run_frame_block(
@@ -176,12 +219,19 @@ class Aggregator(nn.Module):
         embed_dim: int,
         block_idx: int,
         attention_type: str,
+        return_motion: bool = False,
     ) -> torch.Tensor:
         tokens = tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type == "global":
             tokens = tokens.view(batch_size, num_frames * num_tokens, embed_dim)
-            tokens = self.inter_frame_blocks[block_idx](tokens, None)
+            attn = self.inter_frame_blocks[block_idx].attn
+            previous_capture = getattr(attn, "capture_qk", False)
+            attn.capture_qk = return_motion
+            try:
+                tokens = self.inter_frame_blocks[block_idx](tokens, None)
+            finally:
+                attn.capture_qk = previous_capture
             return tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
         if attention_type != "register":
@@ -215,6 +265,21 @@ class Aggregator(nn.Module):
             embed_dim,
         )
         return torch.cat([camera_and_register_tokens, patch_tokens], dim=2)
+
+    def _patch_qk_tensor(
+        self,
+        qk: torch.Tensor,
+        batch_size: int,
+        num_frames: int,
+        num_tokens: int,
+        embed_dim: int,
+    ) -> torch.Tensor:
+        _batch_size, num_heads, _token_count, head_dim = qk.shape
+        if embed_dim != num_heads * head_dim:
+            raise RuntimeError("Attention head dimensions do not match aggregator embed_dim")
+        qk = qk.reshape(batch_size, num_heads, num_frames, num_tokens, head_dim)
+        qk = qk.permute(0, 2, 1, 3, 4).contiguous()
+        return qk[:, :, :, self.patch_token_start :, :].float()
 
 
 def _build_patch_embed(patch_size: int, embed_dim: int) -> DinoVisionTransformer:
