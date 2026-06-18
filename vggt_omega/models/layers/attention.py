@@ -174,6 +174,7 @@ class SelfAttention(nn.Module):
         head_dim = C // self.num_heads
         heads_per_device = self.num_heads // len(self.projected_head_parallel_devices)
         output = None
+        output_dtype = x.dtype
         qkv_bias = self._effective_qkv_bias()
 
         for shard_idx, device in enumerate(self.projected_head_parallel_devices):
@@ -216,6 +217,7 @@ class SelfAttention(nn.Module):
                 )
 
             attn_v = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            output_dtype = attn_v.dtype
             attn_v = attn_v.transpose(1, 2).reshape(B, N, column_end - column_start)
             proj_weight = self.proj.weight[:, column_start:column_end].to(device=device, non_blocking=True)
             with torch.autocast(device_type=device.type, enabled=False):
@@ -227,7 +229,7 @@ class SelfAttention(nn.Module):
             raise RuntimeError("Projected head-parallel attention has no configured devices.")
         if self.proj.bias is not None:
             output = output + self.proj.bias.to(device=source_device, dtype=output.dtype)
-        return self.proj_drop(output.to(dtype=x.dtype))
+        return self.proj_drop(output.to(dtype=output_dtype))
 
     def _effective_qkv_bias(self) -> Tensor | None:
         if self.qkv.bias is None:
