@@ -44,12 +44,6 @@ class VGGTOmega(nn.Module):
         if include_camera_head and self.camera_head is not None:
             self.camera_head.set_head_parallel_devices(devices)
 
-    def enable_global_inter_frame_query_parallelism(
-        self,
-        devices: Sequence[str | torch.device],
-    ) -> None:
-        self.aggregator.set_global_inter_frame_query_parallel_devices(devices)
-
     def enable_memory_parallelism(
         self,
         devices: Sequence[str | torch.device],

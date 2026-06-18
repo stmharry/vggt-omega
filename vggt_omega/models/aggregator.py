@@ -110,13 +110,6 @@ class Aggregator(nn.Module):
         for block in self.inter_frame_blocks:
             block.set_head_parallel_devices(devices)
 
-    def set_global_inter_frame_query_parallel_devices(
-        self,
-        devices: Sequence[str | torch.device] | None,
-    ) -> None:
-        for block, attention_type in zip(self.inter_frame_blocks, self.inter_frame_attention_types):
-            block.set_query_parallel_devices(devices if attention_type == "global" else None)
-
     def set_cache_device(self, device: str | torch.device | None) -> None:
         self.cache_device = None if device is None else torch.device(device)
 

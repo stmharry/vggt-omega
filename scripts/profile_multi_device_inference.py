@@ -181,13 +181,6 @@ def parse_args() -> argparse.Namespace:
         help="Move returned tensors to CPU during pipeline-memory-parallel inference to reduce retained GPU output memory.",
     )
     parser.add_argument(
-        "--query-parallel-devices",
-        help=(
-            "Comma-separated visible CUDA indices used to shard query rows for exact aggregator "
-            "global inter-frame attention in pipeline-memory-parallel."
-        ),
-    )
-    parser.add_argument(
         "--frame-counts",
         default="50,100,200,300,400",
         help="Comma-separated frame counts for capacity mode.",
@@ -221,12 +214,6 @@ def parse_stage_splits(value: str) -> list[int]:
     if not splits:
         raise ValueError("--stage-splits must contain at least one split")
     return splits
-
-
-def parse_optional_cuda_devices(value: str | None) -> list[torch.device]:
-    if value is None:
-        return []
-    return parse_cuda_devices(value)
 
 
 def sorted_image_paths(image_dir: pathlib.Path, limit_frames: int | None) -> list[pathlib.Path]:
@@ -381,7 +368,6 @@ def placement_summary(
     stage_devices: list[str],
     cache_device: str,
     head_device: str,
-    query_parallel_devices: list[str],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     return {
@@ -393,7 +379,6 @@ def placement_summary(
         "input_device": args.input_device,
         "patch_embed_chunk_size": args.patch_embed_chunk_size,
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
-        "query_parallel_devices": query_parallel_devices,
         "parameter_memory_gb_by_class": parameter_memory_classes(model, stage_splits),
         "estimated_cached_aggregator_outputs_gb": estimate_cached_aggregator_output_gb(model, images),
         "estimated_output_tensors_gb": estimate_output_gb(images),
@@ -582,9 +567,6 @@ def run_pipeline_memory_parallel(
         cache_device=args.cache_device,
         head_device_index=args.head_device_index,
     )
-    query_parallel_devices = parse_optional_cuda_devices(args.query_parallel_devices)
-    if query_parallel_devices:
-        model.enable_global_inter_frame_query_parallelism(query_parallel_devices)
     if args.cache_device is None:
         cache_device = str(devices[args.cache_device_index])
         stage_devices = [str(device) for index, device in enumerate(devices) if index != args.cache_device_index]
@@ -601,7 +583,6 @@ def run_pipeline_memory_parallel(
         stage_devices,
         cache_device,
         head_device,
-        [str(device) for device in query_parallel_devices],
         args,
     )
     summary = {
@@ -622,7 +603,6 @@ def run_pipeline_memory_parallel(
         "patch_embed_chunk_size": args.patch_embed_chunk_size,
         "input_device": args.input_device,
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
-        "query_parallel_devices": [str(device) for device in query_parallel_devices],
         "placement": placement,
     }
     reset_memory_stats(devices)

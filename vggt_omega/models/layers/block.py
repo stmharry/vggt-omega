@@ -78,12 +78,6 @@ class SelfAttentionBlock(nn.Module):
             raise TypeError(f"{type(self.attn).__name__} does not support head-parallel devices.")
         setter(devices)
 
-    def set_query_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
-        setter = getattr(self.attn, "set_query_parallel_devices", None)
-        if setter is None:
-            raise TypeError(f"{type(self.attn).__name__} does not support query-parallel devices.")
-        setter(devices)
-
     @staticmethod
     def _maybe_index_rope(rope: tuple[Tensor, Tensor] | None, indices: Tensor) -> tuple[Tensor, Tensor] | None:
         if rope is None:

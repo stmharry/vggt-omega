@@ -80,7 +80,6 @@ class SelfAttention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
         self.proj_drop = nn.Dropout(proj_drop)
         self.head_parallel_devices: tuple[torch.device, ...] = ()
-        self.query_parallel_devices: tuple[torch.device, ...] = ()
 
     def set_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
         if devices is None:
@@ -99,19 +98,6 @@ class SelfAttention(nn.Module):
             if device.type != "cuda":
                 raise ValueError(f"Head-parallel attention requires CUDA devices, got {device}.")
         self.head_parallel_devices = parsed_devices
-
-    def set_query_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
-        if devices is None:
-            self.query_parallel_devices = ()
-            return
-        parsed_devices = tuple(torch.device(device) for device in devices)
-        if len(parsed_devices) <= 1:
-            self.query_parallel_devices = ()
-            return
-        for device in parsed_devices:
-            if device.type != "cuda":
-                raise ValueError(f"Query-parallel attention requires CUDA devices, got {device}.")
-        self.query_parallel_devices = parsed_devices
 
     def apply_rope(self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
@@ -166,27 +152,12 @@ class SelfAttention(nn.Module):
             k = self.k_norm(k)
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
-        if self.query_parallel_devices:
-            x = self.compute_query_parallel_attention(q, k, v)
-        elif self.head_parallel_devices:
+        if self.head_parallel_devices:
             x = self.compute_head_parallel_attention(q, k, v)
         else:
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])
-
-    def compute_query_parallel_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        source_device = q.device
-        chunks = len(self.query_parallel_devices)
-        q_chunks = torch.chunk(q, chunks, dim=2)
-        outputs: list[Tensor] = []
-        for device, q_chunk in zip(self.query_parallel_devices, q_chunks):
-            q_device = q_chunk.to(device=device)
-            k_device = k.to(device=device)
-            v_device = v.to(device=device)
-            output = torch.nn.functional.scaled_dot_product_attention(q_device, k_device, v_device)
-            outputs.append(output.to(device=source_device))
-        return torch.cat(outputs, dim=2)
 
     def compute_head_parallel_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         source_device = q.device
