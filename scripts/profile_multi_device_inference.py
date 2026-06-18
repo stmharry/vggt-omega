@@ -33,9 +33,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("single", "head-parallel", "fsdp", "compare", "capacity"),
+        choices=("single", "head-parallel", "memory-parallel", "fsdp", "compare", "capacity"),
         default="single",
-        help="Inference path to profile. compare runs single and head-parallel sequentially.",
+        help="Inference path to profile. compare runs single and the selected --compare-mode sequentially.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -106,9 +106,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--capacity-mode",
-        choices=("single", "head-parallel"),
-        default="head-parallel",
+        choices=("single", "head-parallel", "memory-parallel"),
+        default="memory-parallel",
         help="Inference path used by capacity mode.",
+    )
+    parser.add_argument(
+        "--compare-mode",
+        choices=("head-parallel", "memory-parallel"),
+        default="memory-parallel",
+        help="GPU-parallel inference path compared against single in compare mode.",
     )
     parser.add_argument(
         "--frame-counts",
@@ -297,6 +303,54 @@ def run_head_parallel(
     }
 
 
+def run_memory_parallel(
+    args: argparse.Namespace,
+    images: torch.Tensor,
+    devices: list[torch.device],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    primary_device = devices[0]
+    model = load_model(args, primary_device)
+    model.enable_memory_parallelism(devices)
+    reset_memory_stats(devices)
+    start = time.perf_counter()
+    with torch.inference_mode():
+        outputs = model(images)
+    synchronize(devices)
+    elapsed = time.perf_counter() - start
+    return outputs, {
+        "mode": "memory-parallel",
+        "status": "completed",
+        "finding": (
+            "Aggregator execution stays on the primary CUDA device, while cached aggregator "
+            "layer outputs are offloaded to the secondary CUDA device and camera/dense heads "
+            "run there to reduce retained primary-device memory."
+        ),
+        "frame_count": int(images.shape[0]),
+        "image_shape": list(images.shape),
+        "devices": [str(device) for device in devices],
+        "cache_device": str(devices[1]),
+        "elapsed_sec": elapsed,
+        "memory": memory_summary(devices),
+        "output_shapes": tensor_shapes(outputs),
+        "finite": output_finite_summary(outputs),
+    }
+
+
+def run_profile_mode(
+    mode: str,
+    args: argparse.Namespace,
+    images: torch.Tensor,
+    devices: list[torch.device],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if mode == "single":
+        return run_single(args, images, devices)
+    if mode == "head-parallel":
+        return run_head_parallel(args, images, devices)
+    if mode == "memory-parallel":
+        return run_memory_parallel(args, images, devices)
+    raise AssertionError(f"Unhandled profile mode: {mode}")
+
+
 def run_fsdp(args: argparse.Namespace, devices: list[torch.device]) -> dict[str, Any]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size < 2:
@@ -420,12 +474,7 @@ def run_capacity(args: argparse.Namespace, devices: list[torch.device]) -> dict[
             )
             continue
         try:
-            if args.capacity_mode == "single":
-                _outputs, summary = run_single(args, images, devices)
-            elif args.capacity_mode == "head-parallel":
-                _outputs, summary = run_head_parallel(args, images, devices)
-            else:
-                raise AssertionError(f"Unhandled capacity mode: {args.capacity_mode}")
+            _outputs, summary = run_profile_mode(args.capacity_mode, args, images, devices)
             summary["status"] = "completed"
             results.append(summary)
             del _outputs
@@ -476,23 +525,22 @@ def main() -> None:
         return
 
     images = load_images(args, devices[0])
-    if args.mode == "single":
-        _outputs, summary = run_single(args, images, devices)
-    elif args.mode == "head-parallel":
-        _outputs, summary = run_head_parallel(args, images, devices)
+    if args.mode in {"single", "head-parallel", "memory-parallel"}:
+        _outputs, summary = run_profile_mode(args.mode, args, images, devices)
     elif args.mode == "compare":
         single_outputs, single_summary = run_single(args, images, devices)
         reference = cpu_outputs(single_outputs)
         del single_outputs
         torch.cuda.empty_cache()
-        parallel_outputs, parallel_summary = run_head_parallel(args, images, devices)
+        parallel_outputs, parallel_summary = run_profile_mode(args.compare_mode, args, images, devices)
         candidate = cpu_outputs(parallel_outputs)
         parity = compare_outputs(reference, candidate, args.parity_atol, args.parity_rtol)
         summary = {
             "mode": "compare",
+            "compare_mode": args.compare_mode,
             "status": "passed" if parity_passed(parity) else "failed",
             "single": single_summary,
-            "head_parallel": parallel_summary,
+            args.compare_mode.replace("-", "_"): parallel_summary,
             "parity": parity,
         }
     else:

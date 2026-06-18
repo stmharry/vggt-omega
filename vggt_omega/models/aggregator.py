@@ -80,6 +80,7 @@ class Aggregator(nn.Module):
         self.depth = depth
         self.patch_size = patch_size
         self.cached_layer_indices = set(cached_layer_indices)
+        self.cache_device: torch.device | None = None
         self.camera_token = nn.Parameter(torch.empty(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.empty(1, 2, num_register_tokens, embed_dim))
         self.patch_token_start = 1 + num_register_tokens
@@ -105,6 +106,9 @@ class Aggregator(nn.Module):
     ) -> None:
         for block in self.inter_frame_blocks:
             block.set_head_parallel_devices(devices)
+
+    def set_cache_device(self, device: str | torch.device | None) -> None:
+        self.cache_device = None if device is None else torch.device(device)
 
     def forward(
         self,
@@ -156,7 +160,10 @@ class Aggregator(nn.Module):
                 self.inter_frame_attention_types[block_idx],
             )
             if block_idx in self.cached_layer_indices:
-                outputs.append(torch.cat([frame_tokens, tokens], dim=-1))
+                cached_tokens = torch.cat([frame_tokens, tokens], dim=-1)
+                if self.cache_device is not None:
+                    cached_tokens = cached_tokens.to(device=self.cache_device, non_blocking=True)
+                outputs.append(cached_tokens)
             else:
                 outputs.append(None)
 

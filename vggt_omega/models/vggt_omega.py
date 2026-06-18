@@ -43,6 +43,25 @@ class VGGTOmega(nn.Module):
         if include_camera_head and self.camera_head is not None:
             self.camera_head.set_head_parallel_devices(devices)
 
+    def enable_memory_parallelism(
+        self,
+        devices: Sequence[str | torch.device],
+    ) -> None:
+        parsed_devices = tuple(torch.device(device) for device in devices)
+        if len(parsed_devices) < 2:
+            raise ValueError("Memory-parallel inference requires at least two CUDA devices.")
+        cache_device = parsed_devices[1]
+        if cache_device.type != "cuda":
+            raise ValueError(f"Memory-parallel inference requires a CUDA cache device, got {cache_device}.")
+
+        self.aggregator.set_cache_device(cache_device)
+        if self.camera_head is not None:
+            self.camera_head.to(device=cache_device)
+        if self.dense_head is not None:
+            self.dense_head.to(device=cache_device)
+        if self.text_alignment_head is not None:
+            self.text_alignment_head.to(device=cache_device)
+
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)

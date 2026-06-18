@@ -147,11 +147,14 @@ Available modes are:
   inter-frame blocks and the camera-head trunk, runs SDPA shards on the
   requested CUDA devices, then gathers heads before the native output projection
   on the primary GPU.
-- `compare`: runs `single` and `head-parallel`, then reports finite
+- `memory-parallel`: keeps aggregator execution on the primary GPU, offloads
+  cached aggregator layer outputs to the secondary GPU, and runs camera/depth
+  heads on that secondary GPU.
+- `compare`: runs `single` and `--compare-mode`, then reports finite
   diagnostics, shape, and drift for `pose_enc`, `depth`, `depth_conf`, and
   `camera_and_register_tokens`.
-- `capacity`: runs `single` or `head-parallel` over a comma-separated
-  `--frame-counts` list and stops at the first CUDA OOM.
+- `capacity`: runs `single`, `head-parallel`, or `memory-parallel` over a
+  comma-separated `--frame-counts` list and stops at the first CUDA OOM.
 
 ## License
 

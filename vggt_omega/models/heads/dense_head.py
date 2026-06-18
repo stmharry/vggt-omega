@@ -79,10 +79,11 @@ class DenseHead(nn.Module):
         if patch_token_start is None:
             raise ValueError("patch_token_start is required for DenseHead")
 
-        _, num_frames, _, _, _ = images.shape
+        image_shape = images.shape
+        _, num_frames, _, _, _ = image_shape
 
         if frames_chunk_size is None or frames_chunk_size >= num_frames:
-            return self._forward_impl(aggregated_tokens_list, images, patch_token_start)
+            return self._forward_impl(aggregated_tokens_list, image_shape, patch_token_start)
 
         assert frames_chunk_size > 0
 
@@ -92,7 +93,7 @@ class DenseHead(nn.Module):
             frames_end_idx = min(frames_start_idx + frames_chunk_size, num_frames)
             depth_chunk, depth_conf_chunk = self._forward_impl(
                 aggregated_tokens_list,
-                images,
+                image_shape,
                 patch_token_start,
                 frames_start_idx,
                 frames_end_idx,
@@ -105,15 +106,16 @@ class DenseHead(nn.Module):
     def _forward_impl(
         self,
         aggregated_tokens_list: list[torch.Tensor | None],
-        images: torch.Tensor,
+        image_shape: torch.Size,
         patch_token_start: int,
         frames_start_idx: int | None = None,
         frames_end_idx: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if frames_start_idx is not None and frames_end_idx is not None:
-            images = images[:, frames_start_idx:frames_end_idx].contiguous()
-
-        batch_size, num_frames, _, height, width = images.shape
+        batch_size, total_frames, _, height, width = image_shape
+        if frames_start_idx is None or frames_end_idx is None:
+            num_frames = total_frames
+        else:
+            num_frames = frames_end_idx - frames_start_idx
         patch_h, patch_w = height // self.patch_size, width // self.patch_size
 
         multi_scale_features = []
