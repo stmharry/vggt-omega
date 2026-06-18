@@ -100,9 +100,9 @@ def patch_saliency_maps(
             maps.append(torch.zeros(q.shape[-2], dtype=torch.float32))
             continue
 
-        early_similarity = temporal_similarity(q[early, frame_index], q[early, source_indices])
-        deep_similarity = temporal_similarity(k[deep, frame_index], k[deep, source_indices])
-        middle_variance = temporal_variance(q[middle, frame_index], q[middle, source_indices])
+        early_similarity = temporal_similarity(q[early, frame_index], q[early][:, source_indices])
+        deep_similarity = temporal_similarity(k[deep, frame_index], k[deep][:, source_indices])
+        middle_variance = temporal_variance(q[middle, frame_index], q[middle][:, source_indices])
         saliency = (1.0 - early_similarity.clamp(-1, 1)) * (1.0 - deep_similarity.clamp(-1, 1))
         saliency = saliency * normalize_map(middle_variance)
         maps.append(normalize_map(saliency).cpu())
