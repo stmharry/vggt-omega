@@ -181,7 +181,8 @@ Available modes are:
   chunking, stage splits, head placement, conservative query-worker roles, and
   an SDPA backend policy. In `capacity` mode, auto-plan runs 3/10/25-frame parity
   probes by default before large-frame tests and records the selected backend and
-  probe results in the JSON output.
+  probe results in the JSON output. Probes run in subprocesses by default so CUDA
+  backend crashes or illegal-access failures do not poison the parent capacity run.
 - `compare`: runs `single` and `--compare-mode`, then reports finite
   diagnostics, shape, and drift for `pose_enc`, `depth`, `depth_conf`, and
   `camera_and_register_tokens`.

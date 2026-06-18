@@ -8,6 +8,9 @@ import copy
 import json
 import os
 import pathlib
+import subprocess
+import sys
+import tempfile
 import time
 from typing import Any
 
@@ -239,6 +242,15 @@ def parse_args() -> argparse.Namespace:
         "--skip-auto-plan-parity",
         action="store_true",
         help="Skip auto-plan parity probes in capacity mode and use the first planned backend candidate directly.",
+    )
+    parser.add_argument(
+        "--auto-plan-probe-isolation",
+        choices=("subprocess", "in-process"),
+        default="subprocess",
+        help=(
+            "How auto-plan parity probes are executed. Subprocess isolation keeps CUDA illegal-access "
+            "or backend crashes from poisoning the parent capacity run."
+        ),
     )
     return parser.parse_args()
 
@@ -1134,6 +1146,100 @@ def compact_probe_summary(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def append_arg(command: list[str], name: str, value: str | int | float | pathlib.Path | None) -> None:
+    if value is None:
+        return
+    command.extend([name, str(value)])
+
+
+def run_compare_probe_subprocess(
+    args: argparse.Namespace,
+    devices: list[torch.device],
+    backend: str,
+    frame_count: int,
+) -> dict[str, Any]:
+    with tempfile.NamedTemporaryFile(prefix="vggt_omega_probe_", suffix=".json", delete=False) as handle:
+        output_path = pathlib.Path(handle.name)
+
+    command = [
+        sys.executable,
+        str(pathlib.Path(__file__).resolve()),
+        "--mode",
+        "compare",
+        "--auto-plan",
+        "--compare-mode",
+        "pipeline-memory-parallel",
+        "--devices",
+        ",".join(str(device.index) for device in devices),
+        "--sdpa-backend",
+        backend,
+        "--limit-frames",
+        str(frame_count),
+        "--synthetic-frames",
+        str(frame_count),
+        "--synthetic-height",
+        str(args.synthetic_height),
+        "--synthetic-width",
+        str(args.synthetic_width),
+        "--image-resolution",
+        str(args.image_resolution),
+        "--preprocess-mode",
+        args.preprocess_mode,
+        "--parity-atol",
+        str(args.parity_atol),
+        "--parity-rtol",
+        str(args.parity_rtol),
+        "--output-json",
+        str(output_path),
+    ]
+    append_arg(command, "--checkpoint", args.checkpoint)
+    append_arg(command, "--image-dir", args.image_dir)
+    append_arg(command, "--patch-embed-chunk-size", args.patch_embed_chunk_size)
+    if args.auto_plan_query_shards == "off":
+        command.append("--auto-plan-query-shards")
+        command.append("off")
+    if args.query_blockwise_devices:
+        command.extend(["--query-blockwise-devices", args.query_blockwise_devices])
+    command.extend(["--query-block-size", str(args.query_block_size)])
+
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        if completed.returncode != 0:
+            return {
+                "status": "exception",
+                "frame_count": frame_count,
+                "error_type": "SubprocessError",
+                "returncode": completed.returncode,
+                "stderr_tail": completed.stderr[-4000:],
+                "stdout_tail": completed.stdout[-2000:],
+            }
+        summary = json.loads(output_path.read_text(encoding="utf-8"))
+        return compact_probe_summary(summary)
+    finally:
+        try:
+            output_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def run_compare_probe_in_process(
+    args: argparse.Namespace,
+    devices: list[torch.device],
+    backend: str,
+    frame_count: int,
+) -> dict[str, Any]:
+    probe_args = copy.copy(args)
+    probe_args.mode = "compare"
+    probe_args.compare_mode = "pipeline-memory-parallel"
+    probe_args.sdpa_backend = backend
+    probe_args.limit_frames = frame_count
+    probe_args.synthetic_frames = frame_count
+    images = load_images(probe_args, devices[0])
+    summary = run_compare(probe_args, images, devices)
+    del images
+    return compact_probe_summary(summary)
+
+
 def run_auto_plan_parity_probes(args: argparse.Namespace, devices: list[torch.device]) -> dict[str, Any]:
     frames = parse_frame_counts(args.auto_plan_parity_frames)
     backend_results = []
@@ -1141,17 +1247,13 @@ def run_auto_plan_parity_probes(args: argparse.Namespace, devices: list[torch.de
         frame_results = []
         backend_passed = True
         for frame_count in frames:
-            probe_args = copy.copy(args)
-            probe_args.mode = "compare"
-            probe_args.compare_mode = "pipeline-memory-parallel"
-            probe_args.sdpa_backend = backend
-            probe_args.limit_frames = frame_count
-            probe_args.synthetic_frames = frame_count
             try:
-                images = load_images(probe_args, devices[0])
-                summary = run_compare(probe_args, images, devices)
-                frame_results.append(compact_probe_summary(summary))
-                backend_passed = backend_passed and summary["status"] == "passed"
+                if args.auto_plan_probe_isolation == "subprocess":
+                    probe_summary = run_compare_probe_subprocess(args, devices, backend, frame_count)
+                else:
+                    probe_summary = run_compare_probe_in_process(args, devices, backend, frame_count)
+                frame_results.append(probe_summary)
+                backend_passed = backend_passed and probe_summary["status"] == "passed"
             except Exception as exc:
                 frame_results.append(
                     {
@@ -1163,9 +1265,10 @@ def run_auto_plan_parity_probes(args: argparse.Namespace, devices: list[torch.de
                 )
                 backend_passed = False
             finally:
-                if "images" in locals():
-                    del images
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
             if not backend_passed:
                 break
         backend_results.append({"backend": backend, "status": "passed" if backend_passed else "failed", "frames": frame_results})
@@ -1205,17 +1308,18 @@ def run_capacity(args: argparse.Namespace, devices: list[torch.device]) -> dict[
     for frame_count in frame_counts:
         args.limit_frames = frame_count
         args.synthetic_frames = frame_count
-        images = load_images(args, devices[0])
-        if int(images.shape[0]) != frame_count:
-            results.append(
-                {
-                    "frame_count": frame_count,
-                    "status": "skipped",
-                    "reason": f"requested {frame_count} frames but loaded {int(images.shape[0])}",
-                }
-            )
-            continue
+        images = None
         try:
+            images = load_images(args, devices[0])
+            if int(images.shape[0]) != frame_count:
+                results.append(
+                    {
+                        "frame_count": frame_count,
+                        "status": "skipped",
+                        "reason": f"requested {frame_count} frames but loaded {int(images.shape[0])}",
+                    }
+                )
+                continue
             _outputs, summary = run_profile_mode(args.capacity_mode, args, images, devices)
             summary["status"] = "completed"
             results.append(summary)
@@ -1230,9 +1334,24 @@ def run_capacity(args: argparse.Namespace, devices: list[torch.device]) -> dict[
         except torch.cuda.OutOfMemoryError as exc:
             results.append({"frame_count": frame_count, "status": "oom", "error": str(exc)})
             break
+        except Exception as exc:
+            results.append(
+                {
+                    "frame_count": frame_count,
+                    "status": "exception",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "memory": memory_summary(devices),
+                }
+            )
+            break
         finally:
-            del images
-            torch.cuda.empty_cache()
+            if images is not None:
+                del images
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
     return {
         "mode": "capacity",
         "capacity_mode": args.capacity_mode,
