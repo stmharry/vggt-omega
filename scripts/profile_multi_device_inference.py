@@ -24,6 +24,12 @@ OUTPUT_KEYS = (
 )
 
 
+class ProfileOutOfMemoryError(RuntimeError):
+    def __init__(self, message: str, summary: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.summary = summary
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -579,13 +585,7 @@ def run_pipeline_memory_parallel(
         head_device,
         args,
     )
-    reset_memory_stats(devices)
-    start = time.perf_counter()
-    with torch.inference_mode():
-        outputs = model(images)
-    synchronize(devices)
-    elapsed = time.perf_counter() - start
-    return outputs, {
+    summary = {
         "mode": "pipeline-memory-parallel",
         "status": "completed",
         "finding": (
@@ -604,11 +604,23 @@ def run_pipeline_memory_parallel(
         "input_device": args.input_device,
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
         "placement": placement,
-        "elapsed_sec": elapsed,
-        "memory": memory_summary(devices),
-        "output_shapes": tensor_shapes(outputs),
-        "finite": output_finite_summary(outputs),
     }
+    reset_memory_stats(devices)
+    start = time.perf_counter()
+    with torch.inference_mode():
+        try:
+            outputs = model(images)
+        except torch.cuda.OutOfMemoryError as exc:
+            summary["status"] = "oom"
+            summary["memory"] = memory_summary(devices)
+            raise ProfileOutOfMemoryError(str(exc), summary) from exc
+    synchronize(devices)
+    elapsed = time.perf_counter() - start
+    summary["elapsed_sec"] = elapsed
+    summary["memory"] = memory_summary(devices)
+    summary["output_shapes"] = tensor_shapes(outputs)
+    summary["finite"] = output_finite_summary(outputs)
+    return outputs, summary
 
 
 def run_profile_mode(
@@ -757,6 +769,13 @@ def run_capacity(args: argparse.Namespace, devices: list[torch.device]) -> dict[
             summary["status"] = "completed"
             results.append(summary)
             del _outputs
+        except ProfileOutOfMemoryError as exc:
+            summary = dict(exc.summary)
+            summary["frame_count"] = frame_count
+            summary["status"] = "oom"
+            summary["error"] = str(exc)
+            results.append(summary)
+            break
         except torch.cuda.OutOfMemoryError as exc:
             results.append({"frame_count": frame_count, "status": "oom", "error": str(exc)})
             break
