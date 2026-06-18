@@ -122,6 +122,34 @@ with the default `mode="balanced"` and `image_resolution=512`. For these roughly
 `mode="max_size"` to resize the longest side to 512 instead; for the same aspect
 ratio, this gives about 512x336 inputs and uses less GPU memory.
 
+### Experimental Multi-Device Profiling
+
+This fork includes an investigation script for comparing single-GPU inference
+with explicit multi-device prototypes:
+
+```bash
+python scripts/profile_multi_device_inference.py \
+  --mode compare \
+  --devices 0,1 \
+  --checkpoint checkpoints/VGGT-Omega-1B-512/model.pt \
+  --image-dir /path/to/frames \
+  --limit-frames 25 \
+  --output-json outputs/vggt_omega_compare_25.json
+```
+
+Available modes are:
+
+- `single`: current single-GPU inference.
+- `dataparallel`: confirms PyTorch `DataParallel` does not shard the usual
+  native video input because VGGT-Omega uses batch size 1 with frames on axis 1.
+- `fsdp`: emits a single-process finding unless launched with
+  `torchrun --nproc_per_node=N`; use it to measure parameter sharding separately.
+- `head-parallel`: experimental exact-attention prototype that splits attention
+  heads across devices for aggregator inter-frame blocks and the camera-head
+  trunk.
+- `compare`: runs `single` and `head-parallel`, then reports shape and drift for
+  `pose_enc`, `depth`, `depth_conf`, and `camera_and_register_tokens`.
+
 ## License
 
 See the [LICENSE](./LICENSE) file for details about the license under which

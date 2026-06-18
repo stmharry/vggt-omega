@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Sequence
+
 import torch
 import torch.nn as nn
 
@@ -96,6 +98,13 @@ class Aggregator(nn.Module):
     def init_weights(self) -> None:
         nn.init.normal_(self.camera_token, std=1e-3)
         nn.init.normal_(self.register_token, std=1e-3)
+
+    def set_inter_frame_head_parallel_devices(
+        self,
+        devices: Sequence[str | torch.device] | None,
+    ) -> None:
+        for block in self.inter_frame_blocks:
+            block.set_head_parallel_devices(devices)
 
     def forward(
         self,

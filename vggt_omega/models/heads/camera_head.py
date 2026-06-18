@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,6 +43,10 @@ class CameraHead(nn.Module):
             nn.GELU(),
             nn.Linear(dim_in // 2, 9, bias=True),
         )
+
+    def set_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
+        for block in self.trunk:
+            block.set_head_parallel_devices(devices)
 
     def forward(
         self,

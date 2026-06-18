@@ -9,7 +9,7 @@
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
 
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -71,6 +71,12 @@ class SelfAttentionBlock(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values, device=device) if init_values else nn.Identity()
 
         self.sample_drop_ratio = drop_path
+
+    def set_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
+        setter = getattr(self.attn, "set_head_parallel_devices", None)
+        if setter is None:
+            raise TypeError(f"{type(self.attn).__name__} does not support head-parallel devices.")
+        setter(devices)
 
     @staticmethod
     def _maybe_index_rope(rope: tuple[Tensor, Tensor] | None, indices: Tensor) -> tuple[Tensor, Tensor] | None:
