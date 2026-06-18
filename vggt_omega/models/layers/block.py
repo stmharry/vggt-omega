@@ -83,12 +83,11 @@ class SelfAttentionBlock(nn.Module):
         devices: Sequence[str | torch.device] | None,
         *,
         query_block_size: int = 2048,
-        key_block_size: int = 4096,
     ) -> None:
         setter = getattr(self.attn, "set_query_blockwise_devices", None)
         if setter is None:
             raise TypeError(f"{type(self.attn).__name__} does not support blockwise query devices.")
-        setter(devices, query_block_size=query_block_size, key_block_size=key_block_size)
+        setter(devices, query_block_size=query_block_size)
 
     @staticmethod
     def _maybe_index_rope(rope: tuple[Tensor, Tensor] | None, indices: Tensor) -> tuple[Tensor, Tensor] | None:

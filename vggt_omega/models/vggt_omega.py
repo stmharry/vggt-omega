@@ -49,12 +49,10 @@ class VGGTOmega(nn.Module):
         devices: Sequence[str | torch.device],
         *,
         query_block_size: int = 2048,
-        key_block_size: int = 4096,
     ) -> None:
         self.aggregator.set_global_inter_frame_query_blockwise_devices(
             devices,
             query_block_size=query_block_size,
-            key_block_size=key_block_size,
         )
 
     def enable_memory_parallelism(

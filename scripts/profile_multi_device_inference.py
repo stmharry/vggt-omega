@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import pathlib
@@ -48,6 +49,7 @@ def parse_args() -> argparse.Namespace:
             "fsdp",
             "compare",
             "capacity",
+            "plan",
         ),
         default="single",
         help="Inference path to profile. compare runs single and the selected --compare-mode sequentially.",
@@ -194,15 +196,49 @@ def parse_args() -> argparse.Namespace:
         help="Query rows per block for --query-blockwise-devices.",
     )
     parser.add_argument(
-        "--key-block-size",
-        type=int,
-        default=4096,
-        help="Key/value rows per online-softmax block for --query-blockwise-devices.",
+        "--sdpa-backend",
+        choices=("auto", "efficient", "flash_math", "math"),
+        default="auto",
+        help=(
+            "Scaled dot-product attention backend policy. 'efficient' disables flash, "
+            "math, and cuDNN SDPA; 'flash_math' enables flash with math fallback and "
+            "disables memory-efficient and cuDNN SDPA; 'math' disables flash, "
+            "memory-efficient, and cuDNN SDPA."
+        ),
     )
     parser.add_argument(
         "--frame-counts",
         default="50,100,200,300,400",
         help="Comma-separated frame counts for capacity mode.",
+    )
+    parser.add_argument(
+        "--auto-plan",
+        action="store_true",
+        help=(
+            "Choose pipeline-memory-parallel placement from device inventory and memory estimates. "
+            "Capacity mode also runs parity probes before large-frame tests unless --skip-auto-plan-parity is set."
+        ),
+    )
+    parser.add_argument(
+        "--auto-plan-query-shards",
+        choices=("auto", "off"),
+        default="auto",
+        help="Whether auto-plan may enable exact query-sharded aggregator attention.",
+    )
+    parser.add_argument(
+        "--auto-plan-sdpa-backends",
+        default="flash_math,efficient,auto,math",
+        help="Comma-separated SDPA backend policies tried by auto-plan parity probes.",
+    )
+    parser.add_argument(
+        "--auto-plan-parity-frames",
+        default="3,10,25",
+        help="Comma-separated frame counts used by auto-plan capacity parity probes.",
+    )
+    parser.add_argument(
+        "--skip-auto-plan-parity",
+        action="store_true",
+        help="Skip auto-plan parity probes in capacity mode and use the first planned backend candidate directly.",
     )
     return parser.parse_args()
 
@@ -239,6 +275,61 @@ def parse_optional_cuda_devices(value: str | None) -> list[torch.device]:
     if value is None:
         return []
     return parse_cuda_devices(value)
+
+
+def configure_sdpa_backend(backend: str) -> None:
+    if backend == "auto":
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
+        torch.backends.cuda.enable_cudnn_sdp(True)
+        return
+    if backend == "efficient":
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(False)
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        return
+    if backend == "flash_math":
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        return
+    if backend == "math":
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        return
+    raise ValueError(f"Unsupported SDPA backend policy: {backend}")
+
+
+def parse_sdpa_backends(value: str) -> list[str]:
+    backends = [part.strip() for part in value.split(",") if part.strip()]
+    if not backends:
+        raise ValueError("--auto-plan-sdpa-backends must contain at least one backend")
+    allowed = {"auto", "efficient", "flash_math", "math"}
+    unknown = sorted(set(backends) - allowed)
+    if unknown:
+        raise ValueError(f"Unsupported SDPA backends in --auto-plan-sdpa-backends: {unknown}")
+    return backends
+
+
+def apply_auto_plan_runtime_defaults(args: argparse.Namespace) -> None:
+    if not args.auto_plan:
+        return
+    args.compare_mode = "pipeline-memory-parallel"
+    args.capacity_mode = "pipeline-memory-parallel"
+    args.input_device = "cpu"
+    args.cache_device = "cpu"
+    args.offload_outputs_to_cpu = True
+    if args.patch_embed_chunk_size is None:
+        args.patch_embed_chunk_size = 32
+    if args.head_device_index is None:
+        args.head_device_index = 0
+    if args.sdpa_backend == "auto":
+        args.sdpa_backend = parse_sdpa_backends(args.auto_plan_sdpa_backends)[0]
 
 
 def sorted_image_paths(image_dir: pathlib.Path, limit_frames: int | None) -> list[pathlib.Path]:
@@ -385,6 +476,200 @@ def estimate_output_gb(images: torch.Tensor) -> dict[str, float]:
     }
 
 
+def image_shape_info(images: torch.Tensor) -> dict[str, int]:
+    if images.dim() == 4:
+        num_frames, num_channels, height, width = images.shape
+        batch_size = 1
+    elif images.dim() == 5:
+        batch_size, num_frames, num_channels, height, width = images.shape
+    else:
+        raise ValueError(f"Unsupported image tensor shape for planning: {tuple(images.shape)}")
+    return {
+        "batch_size": int(batch_size),
+        "num_frames": int(num_frames),
+        "num_channels": int(num_channels),
+        "height": int(height),
+        "width": int(width),
+    }
+
+
+def token_estimate(model: VGGTOmega, images: torch.Tensor) -> dict[str, int | float | str]:
+    shape = image_shape_info(images)
+    patch_h = shape["height"] // model.aggregator.patch_size
+    patch_w = shape["width"] // model.aggregator.patch_size
+    frame_tokens = model.aggregator.patch_token_start + patch_h * patch_w
+    sequence_tokens = shape["num_frames"] * frame_tokens
+    embed_dim = int(model.aggregator.camera_token.shape[-1])
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    live_token_gb = shape["batch_size"] * sequence_tokens * embed_dim * torch.empty((), dtype=amp_dtype).element_size()
+    return {
+        **shape,
+        "patch_grid_h": patch_h,
+        "patch_grid_w": patch_w,
+        "frame_tokens": frame_tokens,
+        "sequence_tokens": sequence_tokens,
+        "embed_dim": embed_dim,
+        "amp_dtype": str(amp_dtype),
+        "live_token_gb": live_token_gb / (1024**3),
+    }
+
+
+def device_inventory(devices: list[torch.device]) -> list[dict[str, Any]]:
+    inventory = []
+    for device in devices:
+        props = torch.cuda.get_device_properties(device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        inventory.append(
+            {
+                "device": str(device),
+                "name": props.name,
+                "total_gb": total_bytes / (1024**3),
+                "free_gb": free_bytes / (1024**3),
+                "used_gb": (total_bytes - free_bytes) / (1024**3),
+                "multi_processor_count": props.multi_processor_count,
+                "compute_capability": f"{props.major}.{props.minor}",
+            }
+        )
+    return inventory
+
+
+def block_weight_gb(model: VGGTOmega, block_idx: int) -> float:
+    prefixes = (
+        f"aggregator.frame_blocks.{block_idx}.",
+        f"aggregator.inter_frame_blocks.{block_idx}.",
+    )
+    byte_count = 0
+    for name, value in model.named_parameters():
+        if name.startswith(prefixes):
+            byte_count += tensor_bytes(value)
+    for name, value in model.named_buffers():
+        if name.startswith(prefixes):
+            byte_count += tensor_bytes(value)
+    return byte_count / (1024**3)
+
+
+def choose_weighted_stage_splits(
+    model: VGGTOmega,
+    stage_devices: list[torch.device],
+    inventory: list[dict[str, Any]],
+    reserve_primary_for_patch: bool,
+) -> list[int]:
+    depth = model.aggregator.depth
+    if len(stage_devices) == 1:
+        return []
+
+    active_stage_devices = stage_devices[1:] if reserve_primary_for_patch else stage_devices
+    if not active_stage_devices:
+        return []
+
+    device_free = {entry["device"]: max(float(entry["free_gb"]), 1.0) for entry in inventory}
+    capacities = [device_free[str(device)] for device in active_stage_devices]
+    total_capacity = sum(capacities)
+    block_weights = [block_weight_gb(model, block_idx) for block_idx in range(depth)]
+    total_weight = sum(block_weights)
+    splits = [0] if reserve_primary_for_patch else []
+    cumulative = 0.0
+    next_target_index = 0
+    targets = []
+    running_capacity = 0.0
+    for capacity in capacities[:-1]:
+        running_capacity += capacity
+        targets.append(total_weight * running_capacity / total_capacity)
+
+    for block_idx, block_weight in enumerate(block_weights, start=1):
+        cumulative += block_weight
+        if next_target_index < len(targets) and cumulative >= targets[next_target_index]:
+            split_block = min(max(block_idx, 0), depth)
+            if not splits or split_block > splits[-1]:
+                splits.append(split_block)
+            next_target_index += 1
+
+    while len(splits) < len(stage_devices) - 1:
+        candidate = 0 if not splits else min(depth, splits[-1] + 1)
+        splits.append(candidate)
+    return splits[: len(stage_devices) - 1]
+
+
+def choose_query_devices(
+    devices: list[torch.device],
+    stage_splits: list[int],
+    inventory: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> list[torch.device]:
+    if args.auto_plan_query_shards == "off" or len(devices) < 3:
+        return []
+    if args.query_blockwise_devices:
+        return parse_optional_cuda_devices(args.query_blockwise_devices)
+
+    stage_block_counts = {str(device): 0 for device in devices}
+    for block_idx in range(24):
+        stage_idx = min(block_stage_index(block_idx, stage_splits), len(devices) - 1)
+        stage_block_counts[str(devices[stage_idx])] += 1
+    free_by_device = {entry["device"]: float(entry["free_gb"]) for entry in inventory}
+    eligible_devices = [device for device in devices if stage_block_counts[str(device)] == 0]
+    if len(eligible_devices) < 2:
+        return []
+    ranked = sorted(
+        eligible_devices,
+        key=lambda device: (stage_block_counts[str(device)], -free_by_device[str(device)]),
+    )
+    return ranked[: min(2, len(ranked))]
+
+
+def auto_pipeline_plan(
+    args: argparse.Namespace,
+    model: VGGTOmega,
+    images: torch.Tensor,
+    devices: list[torch.device],
+) -> dict[str, Any]:
+    inventory = device_inventory(devices)
+    stage_devices = devices
+    reserve_primary_for_patch = len(stage_devices) > 1
+    stage_splits = choose_weighted_stage_splits(
+        model,
+        stage_devices,
+        inventory,
+        reserve_primary_for_patch=reserve_primary_for_patch,
+    )
+    stage_block_counts = {str(device): 0 for device in stage_devices}
+    for block_idx in range(model.aggregator.depth):
+        stage_idx = min(block_stage_index(block_idx, stage_splits), len(stage_devices) - 1)
+        stage_block_counts[str(stage_devices[stage_idx])] += 1
+    query_devices = choose_query_devices(devices, stage_splits, inventory, args)
+    if query_devices and args.query_block_size == 2048:
+        args.query_block_size = 8192
+
+    args.stage_splits = ",".join(str(split) for split in stage_splits)
+    args.cache_device = "cpu"
+    args.head_device_index = 0
+    args.input_device = "cpu"
+    args.offload_outputs_to_cpu = True
+    args.query_blockwise_devices = ",".join(str(device.index) for device in query_devices) if query_devices else None
+
+    return {
+        "source": "auto",
+        "device_inventory": inventory,
+        "token_estimate": token_estimate(model, images),
+        "roles": {
+            "patch_device": str(devices[0]),
+            "head_device": str(devices[args.head_device_index]),
+            "cache_device": args.cache_device,
+            "output_device": "cpu",
+            "stage_devices": [str(device) for device in stage_devices],
+            "query_worker_devices": [str(device) for device in query_devices],
+        },
+        "stage_splits": stage_splits,
+        "stage_block_counts": stage_block_counts,
+        "query_block_size": args.query_block_size,
+        "sdpa_backend": args.sdpa_backend,
+        "rationale": (
+            "Auto-plan keeps inputs/cached outputs/final outputs on CPU, reserves the first CUDA device "
+            "for patch embedding and heads when multiple GPUs are visible, splits aggregator blocks across "
+            "remaining stage capacity, and only assigns query-worker roles to the lowest estimated stage-pressure devices."
+        ),
+    }
+
+
 def placement_summary(
     model: VGGTOmega,
     images: torch.Tensor,
@@ -407,7 +692,7 @@ def placement_summary(
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
         "query_blockwise_devices": query_blockwise_devices,
         "query_block_size": args.query_block_size,
-        "key_block_size": args.key_block_size,
+        "sdpa_backend": args.sdpa_backend,
         "parameter_memory_gb_by_class": parameter_memory_classes(model, stage_splits),
         "estimated_cached_aggregator_outputs_gb": estimate_cached_aggregator_output_gb(model, images),
         "estimated_output_tensors_gb": estimate_output_gb(images),
@@ -583,8 +868,9 @@ def run_pipeline_memory_parallel(
     devices: list[torch.device],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     primary_device = devices[0]
-    stage_splits = parse_stage_splits(args.stage_splits)
     model = load_model(args, primary_device)
+    planner_summary = auto_pipeline_plan(args, model, images, devices) if args.auto_plan else {"source": "manual"}
+    stage_splits = parse_stage_splits(args.stage_splits)
     model.set_patch_embed_chunk_size(args.patch_embed_chunk_size)
     if args.offload_outputs_to_cpu:
         model.set_output_device("cpu")
@@ -601,7 +887,6 @@ def run_pipeline_memory_parallel(
         model.enable_global_inter_frame_query_blockwise_parallelism(
             query_blockwise_devices,
             query_block_size=args.query_block_size,
-            key_block_size=args.key_block_size,
         )
     if args.cache_device is None:
         cache_device = str(devices[args.cache_device_index])
@@ -642,7 +927,8 @@ def run_pipeline_memory_parallel(
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
         "query_blockwise_devices": [str(device) for device in query_blockwise_devices],
         "query_block_size": args.query_block_size,
-        "key_block_size": args.key_block_size,
+        "sdpa_backend": args.sdpa_backend,
+        "planner": planner_summary,
         "placement": placement,
     }
     reset_memory_stats(devices)
@@ -680,6 +966,30 @@ def run_profile_mode(
     if mode == "pipeline-memory-parallel":
         return run_pipeline_memory_parallel(args, images, devices)
     raise AssertionError(f"Unhandled profile mode: {mode}")
+
+
+def run_plan(args: argparse.Namespace, devices: list[torch.device]) -> dict[str, Any]:
+    primary_device = devices[0]
+    images = load_images(args, primary_device)
+    model = load_model(args, primary_device)
+    planner_summary = auto_pipeline_plan(args, model, images, devices) if args.auto_plan else {"source": "manual"}
+    stage_splits = parse_stage_splits(args.stage_splits)
+    return {
+        "mode": "plan",
+        "status": "completed",
+        "devices": [str(device) for device in devices],
+        "frame_count": int(images.shape[0]),
+        "image_shape": list(images.shape),
+        "stage_splits": stage_splits,
+        "cache_device": args.cache_device,
+        "head_device_index": args.head_device_index,
+        "input_device": args.input_device,
+        "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
+        "query_blockwise_devices": [str(device) for device in parse_optional_cuda_devices(args.query_blockwise_devices)],
+        "query_block_size": args.query_block_size,
+        "sdpa_backend": args.sdpa_backend,
+        "planner": planner_summary,
+    }
 
 
 def run_fsdp(args: argparse.Namespace, devices: list[torch.device]) -> dict[str, Any]:
@@ -788,7 +1098,108 @@ def parity_passed(parity: dict[str, Any]) -> bool:
     return all(value.get("status") == "passed" for value in parity.values())
 
 
+def run_compare(args: argparse.Namespace, images: torch.Tensor, devices: list[torch.device]) -> dict[str, Any]:
+    configure_sdpa_backend(args.sdpa_backend)
+    single_outputs, single_summary = run_single(args, images, devices)
+    reference = cpu_outputs(single_outputs)
+    del single_outputs
+    torch.cuda.empty_cache()
+    parallel_outputs, parallel_summary = run_profile_mode(args.compare_mode, args, images, devices)
+    candidate = cpu_outputs(parallel_outputs)
+    parity = compare_outputs(reference, candidate, args.parity_atol, args.parity_rtol)
+    return {
+        "mode": "compare",
+        "compare_mode": args.compare_mode,
+        "status": "passed" if parity_passed(parity) else "failed",
+        "single": single_summary,
+        args.compare_mode.replace("-", "_"): parallel_summary,
+        "parity": parity,
+    }
+
+
+def compact_probe_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    candidate_key = summary["compare_mode"].replace("-", "_")
+    candidate = summary[candidate_key]
+    return {
+        "status": summary["status"],
+        "frame_count": candidate["frame_count"],
+        "image_shape": candidate["image_shape"],
+        "sdpa_backend": candidate.get("sdpa_backend"),
+        "stage_splits": candidate.get("stage_splits"),
+        "query_blockwise_devices": candidate.get("query_blockwise_devices"),
+        "query_block_size": candidate.get("query_block_size"),
+        "single_memory": summary["single"].get("memory"),
+        "candidate_memory": candidate.get("memory"),
+        "parity": summary["parity"],
+    }
+
+
+def run_auto_plan_parity_probes(args: argparse.Namespace, devices: list[torch.device]) -> dict[str, Any]:
+    frames = parse_frame_counts(args.auto_plan_parity_frames)
+    backend_results = []
+    for backend in parse_sdpa_backends(args.auto_plan_sdpa_backends):
+        frame_results = []
+        backend_passed = True
+        for frame_count in frames:
+            probe_args = copy.copy(args)
+            probe_args.mode = "compare"
+            probe_args.compare_mode = "pipeline-memory-parallel"
+            probe_args.sdpa_backend = backend
+            probe_args.limit_frames = frame_count
+            probe_args.synthetic_frames = frame_count
+            try:
+                images = load_images(probe_args, devices[0])
+                summary = run_compare(probe_args, images, devices)
+                frame_results.append(compact_probe_summary(summary))
+                backend_passed = backend_passed and summary["status"] == "passed"
+            except Exception as exc:
+                frame_results.append(
+                    {
+                        "status": "exception",
+                        "frame_count": frame_count,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                backend_passed = False
+            finally:
+                if "images" in locals():
+                    del images
+                torch.cuda.empty_cache()
+            if not backend_passed:
+                break
+        backend_results.append({"backend": backend, "status": "passed" if backend_passed else "failed", "frames": frame_results})
+        if backend_passed:
+            args.sdpa_backend = backend
+            configure_sdpa_backend(backend)
+            return {
+                "status": "passed",
+                "selected_backend": backend,
+                "requested_frames": frames,
+                "backend_results": backend_results,
+            }
+    return {
+        "status": "failed",
+        "selected_backend": None,
+        "requested_frames": frames,
+        "backend_results": backend_results,
+    }
+
+
 def run_capacity(args: argparse.Namespace, devices: list[torch.device]) -> dict[str, Any]:
+    parity_probes = None
+    if args.auto_plan and not args.skip_auto_plan_parity:
+        parity_probes = run_auto_plan_parity_probes(args, devices)
+        if parity_probes["status"] != "passed":
+            return {
+                "mode": "capacity",
+                "capacity_mode": args.capacity_mode,
+                "status": "failed_parity_probe",
+                "auto_plan_parity": parity_probes,
+                "frame_counts": parse_frame_counts(args.frame_counts),
+                "results": [],
+            }
+
     results = []
     frame_counts = parse_frame_counts(args.frame_counts)
     for frame_count in frame_counts:
@@ -825,6 +1236,7 @@ def run_capacity(args: argparse.Namespace, devices: list[torch.device]) -> dict[
     return {
         "mode": "capacity",
         "capacity_mode": args.capacity_mode,
+        "auto_plan_parity": parity_probes,
         "frame_counts": frame_counts,
         "results": results,
     }
@@ -852,7 +1264,13 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for VGGT-Omega multi-device profiling.")
+    apply_auto_plan_runtime_defaults(args)
+    configure_sdpa_backend(args.sdpa_backend)
     devices = parse_cuda_devices(args.devices)
+
+    if args.mode == "plan":
+        emit_summary(run_plan(args, devices), args.output_json)
+        return
 
     if args.mode == "fsdp":
         emit_summary(run_fsdp(args, devices), args.output_json)
@@ -872,21 +1290,7 @@ def main() -> None:
     }:
         _outputs, summary = run_profile_mode(args.mode, args, images, devices)
     elif args.mode == "compare":
-        single_outputs, single_summary = run_single(args, images, devices)
-        reference = cpu_outputs(single_outputs)
-        del single_outputs
-        torch.cuda.empty_cache()
-        parallel_outputs, parallel_summary = run_profile_mode(args.compare_mode, args, images, devices)
-        candidate = cpu_outputs(parallel_outputs)
-        parity = compare_outputs(reference, candidate, args.parity_atol, args.parity_rtol)
-        summary = {
-            "mode": "compare",
-            "compare_mode": args.compare_mode,
-            "status": "passed" if parity_passed(parity) else "failed",
-            "single": single_summary,
-            args.compare_mode.replace("-", "_"): parallel_summary,
-            "parity": parity,
-        }
+        summary = run_compare(args, images, devices)
     else:
         raise AssertionError(f"Unhandled mode: {args.mode}")
     emit_summary(summary, args.output_json)

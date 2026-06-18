@@ -167,10 +167,21 @@ Available modes are:
   during inference. The JSON summary includes a `placement` object with parameter
   memory by class, estimated cached aggregator output size, and estimated output
   tensor size.
-  `--query-blockwise-devices 0,1,2,3` enables the exact blockwise query-sharded
+  `--query-blockwise-devices 0,1,2,3` enables the exact SDPA query-sharded
   prototype for aggregator global inter-frame attention. Query rows are split
-  across visible CUDA devices, each query block streams over all K/V blocks with
-  fp32 online softmax, and outputs are gathered in original sequence order.
+  across visible CUDA devices, each query block attends to the full K/V sequence,
+  and outputs are gathered in original sequence order. Use `--sdpa-backend
+  flash_math` for parity and capacity runs so the single-GPU reference and
+  query-sharded candidate use flash attention where supported with math fallback
+  for unsupported SDPA calls.
+- `plan`: inspects visible CUDA devices, estimates token/cache/output/model memory
+  classes, and emits the placement selected by `--auto-plan` without running the
+  full model. `--auto-plan` can also be used with `compare`, `capacity`, and
+  `pipeline-memory-parallel`; it selects CPU input/cache/output staging, patch
+  chunking, stage splits, head placement, conservative query-worker roles, and
+  an SDPA backend policy. In `capacity` mode, auto-plan runs 3/10/25-frame parity
+  probes by default before large-frame tests and records the selected backend and
+  probe results in the JSON output.
 - `compare`: runs `single` and `--compare-mode`, then reports finite
   diagnostics, shape, and drift for `pose_enc`, `depth`, `depth_conf`, and
   `camera_and_register_tokens`.
