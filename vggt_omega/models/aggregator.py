@@ -81,6 +81,8 @@ class Aggregator(nn.Module):
         self.patch_size = patch_size
         self.cached_layer_indices = set(cached_layer_indices)
         self.cache_device: torch.device | None = None
+        self.stage_split_block: int | None = None
+        self.stage_device: torch.device | None = None
         self.camera_token = nn.Parameter(torch.empty(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.empty(1, 2, num_register_tokens, embed_dim))
         self.patch_token_start = 1 + num_register_tokens
@@ -109,6 +111,30 @@ class Aggregator(nn.Module):
 
     def set_cache_device(self, device: str | torch.device | None) -> None:
         self.cache_device = None if device is None else torch.device(device)
+
+    def set_stage_devices(
+        self,
+        primary_device: str | torch.device,
+        stage_device: str | torch.device,
+        split_block: int,
+    ) -> None:
+        primary_device = torch.device(primary_device)
+        stage_device = torch.device(stage_device)
+        if primary_device.type != "cuda" or stage_device.type != "cuda":
+            raise ValueError(
+                "Balanced memory-parallel inference requires CUDA stage devices, "
+                f"got primary={primary_device}, stage={stage_device}."
+            )
+        if split_block < 0 or split_block > self.depth:
+            raise ValueError(f"split_block must be in [0, {self.depth}], got {split_block}.")
+
+        self.stage_split_block = split_block
+        self.stage_device = stage_device
+        self.cache_device = stage_device
+        for block_idx in range(self.depth):
+            block_device = stage_device if block_idx >= split_block else primary_device
+            self.frame_blocks[block_idx].to(device=block_device)
+            self.inter_frame_blocks[block_idx].to(device=block_device)
 
     def forward(
         self,
@@ -141,6 +167,14 @@ class Aggregator(nn.Module):
 
         outputs = []
         for block_idx in range(self.depth):
+            if block_idx == self.stage_split_block:
+                if self.stage_device is None:
+                    raise RuntimeError("stage_device is required when stage_split_block is set.")
+                tokens = tokens.to(device=self.stage_device, non_blocking=True)
+                frame_rope = (
+                    frame_rope[0].to(device=self.stage_device, non_blocking=True),
+                    frame_rope[1].to(device=self.stage_device, non_blocking=True),
+                )
             tokens, frame_tokens = self._run_frame_block(
                 tokens,
                 batch_size,

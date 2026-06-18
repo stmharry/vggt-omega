@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("single", "head-parallel", "memory-parallel", "fsdp", "compare", "capacity"),
+        choices=("single", "head-parallel", "memory-parallel", "balanced-memory-parallel", "fsdp", "compare", "capacity"),
         default="single",
         help="Inference path to profile. compare runs single and the selected --compare-mode sequentially.",
     )
@@ -106,15 +106,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--capacity-mode",
-        choices=("single", "head-parallel", "memory-parallel"),
+        choices=("single", "head-parallel", "memory-parallel", "balanced-memory-parallel"),
         default="memory-parallel",
         help="Inference path used by capacity mode.",
     )
     parser.add_argument(
         "--compare-mode",
-        choices=("head-parallel", "memory-parallel"),
+        choices=("head-parallel", "memory-parallel", "balanced-memory-parallel"),
         default="memory-parallel",
         help="GPU-parallel inference path compared against single in compare mode.",
+    )
+    parser.add_argument(
+        "--split-block",
+        type=int,
+        default=12,
+        help="Aggregator block index where balanced-memory-parallel moves live tokens to the secondary device.",
     )
     parser.add_argument(
         "--frame-counts",
@@ -336,6 +342,40 @@ def run_memory_parallel(
     }
 
 
+def run_balanced_memory_parallel(
+    args: argparse.Namespace,
+    images: torch.Tensor,
+    devices: list[torch.device],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    primary_device = devices[0]
+    model = load_model(args, primary_device)
+    model.enable_balanced_memory_parallelism(devices, split_block=args.split_block)
+    reset_memory_stats(devices)
+    start = time.perf_counter()
+    with torch.inference_mode():
+        outputs = model(images)
+    synchronize(devices)
+    elapsed = time.perf_counter() - start
+    return outputs, {
+        "mode": "balanced-memory-parallel",
+        "status": "completed",
+        "finding": (
+            "Patch embedding and early aggregator blocks run on the primary CUDA device, "
+            "later aggregator blocks and live tokens move to the secondary CUDA device, "
+            "and cached outputs plus camera/dense heads remain on the secondary device."
+        ),
+        "frame_count": int(images.shape[0]),
+        "image_shape": list(images.shape),
+        "devices": [str(device) for device in devices],
+        "split_block": args.split_block,
+        "stage_device": str(devices[1]),
+        "elapsed_sec": elapsed,
+        "memory": memory_summary(devices),
+        "output_shapes": tensor_shapes(outputs),
+        "finite": output_finite_summary(outputs),
+    }
+
+
 def run_profile_mode(
     mode: str,
     args: argparse.Namespace,
@@ -348,6 +388,8 @@ def run_profile_mode(
         return run_head_parallel(args, images, devices)
     if mode == "memory-parallel":
         return run_memory_parallel(args, images, devices)
+    if mode == "balanced-memory-parallel":
+        return run_balanced_memory_parallel(args, images, devices)
     raise AssertionError(f"Unhandled profile mode: {mode}")
 
 
@@ -525,7 +567,7 @@ def main() -> None:
         return
 
     images = load_images(args, devices[0])
-    if args.mode in {"single", "head-parallel", "memory-parallel"}:
+    if args.mode in {"single", "head-parallel", "memory-parallel", "balanced-memory-parallel"}:
         _outputs, summary = run_profile_mode(args.mode, args, images, devices)
     elif args.mode == "compare":
         single_outputs, single_summary = run_single(args, images, devices)

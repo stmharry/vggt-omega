@@ -62,6 +62,30 @@ class VGGTOmega(nn.Module):
         if self.text_alignment_head is not None:
             self.text_alignment_head.to(device=cache_device)
 
+    def enable_balanced_memory_parallelism(
+        self,
+        devices: Sequence[str | torch.device],
+        *,
+        split_block: int = 12,
+    ) -> None:
+        parsed_devices = tuple(torch.device(device) for device in devices)
+        if len(parsed_devices) < 2:
+            raise ValueError("Balanced memory-parallel inference requires at least two CUDA devices.")
+        primary_device, stage_device = parsed_devices[0], parsed_devices[1]
+        if primary_device.type != "cuda" or stage_device.type != "cuda":
+            raise ValueError(
+                "Balanced memory-parallel inference requires CUDA devices, "
+                f"got primary={primary_device}, stage={stage_device}."
+            )
+
+        self.aggregator.set_stage_devices(primary_device, stage_device, split_block)
+        if self.camera_head is not None:
+            self.camera_head.to(device=stage_device)
+        if self.dense_head is not None:
+            self.dense_head.to(device=stage_device)
+        if self.text_alignment_head is not None:
+            self.text_alignment_head.to(device=stage_device)
+
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
