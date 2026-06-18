@@ -159,6 +159,14 @@ Available modes are:
   `--cache-device-index`. For four visible devices, `--stage-splits 8,16` with
   `--cache-device-index 3` uses devices 0/1/2 for aggregator stages and device
   3 for cached outputs and heads.
+  To use all visible CUDA devices for aggregator execution, set
+  `--cache-device cpu`. In that placement, `--head-device-index` selects the GPU
+  for camera/depth heads, `--input-device cpu` keeps preprocessed frames staged
+  on CPU until patch embedding, `--patch-embed-chunk-size` limits patch-embed
+  transient memory, and `--offload-outputs-to-cpu` moves returned tensors off GPU
+  during inference. The JSON summary includes a `placement` object with parameter
+  memory by class, estimated cached aggregator output size, and estimated output
+  tensor size.
 - `compare`: runs `single` and `--compare-mode`, then reports finite
   diagnostics, shape, and drift for `pose_enc`, `depth`, `depth_conf`, and
   `camera_and_register_tokens`.

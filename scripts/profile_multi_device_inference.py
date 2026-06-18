@@ -274,6 +274,111 @@ def memory_summary(devices: list[torch.device]) -> dict[str, dict[str, float]]:
     return summary
 
 
+def tensor_bytes(value: torch.Tensor) -> int:
+    return value.numel() * value.element_size()
+
+
+def add_bytes(summary: dict[str, dict[str, int]], class_name: str, device: torch.device, byte_count: int) -> None:
+    class_summary = summary.setdefault(class_name, {})
+    device_name = str(device)
+    class_summary[device_name] = class_summary.get(device_name, 0) + byte_count
+
+
+def block_stage_index(block_idx: int, stage_splits: list[int]) -> int:
+    return sum(split_block <= block_idx for split_block in stage_splits)
+
+
+def parameter_memory_classes(model: VGGTOmega, stage_splits: list[int]) -> dict[str, dict[str, float]]:
+    class_bytes: dict[str, dict[str, int]] = {}
+    tensors = list(model.named_parameters()) + list(model.named_buffers())
+    for name, value in tensors:
+        if value.device.type == "meta":
+            continue
+        byte_count = tensor_bytes(value)
+        if name.startswith("aggregator.patch_embed"):
+            class_name = "input_patch_embed_weights"
+        elif name.startswith("aggregator.frame_blocks.") or name.startswith("aggregator.inter_frame_blocks."):
+            parts = name.split(".")
+            block_idx = int(parts[2])
+            class_name = f"aggregator_stage_{block_stage_index(block_idx, stage_splits)}_weights"
+        elif name.startswith("aggregator."):
+            class_name = "aggregator_token_and_buffer_state"
+        elif name.startswith("camera_head.") or name.startswith("dense_head.") or name.startswith("text_alignment_head."):
+            class_name = "head_weights"
+        else:
+            class_name = "other_weights"
+        add_bytes(class_bytes, class_name, value.device, byte_count)
+
+    return {
+        class_name: {device: byte_count / (1024**3) for device, byte_count in devices.items()}
+        for class_name, devices in sorted(class_bytes.items())
+    }
+
+
+def estimate_cached_aggregator_output_gb(model: VGGTOmega, images: torch.Tensor) -> float:
+    if images.dim() == 4:
+        num_frames, _, height, width = images.shape
+        batch_size = 1
+    elif images.dim() == 5:
+        batch_size, num_frames, _, height, width = images.shape
+    else:
+        return 0.0
+
+    patch_h = height // model.aggregator.patch_size
+    patch_w = width // model.aggregator.patch_size
+    num_tokens = model.aggregator.patch_token_start + patch_h * patch_w
+    embed_dim = model.aggregator.camera_token.shape[-1]
+    cached_layers = len(model.aggregator.cached_layer_indices)
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    element_size = torch.empty((), dtype=amp_dtype).element_size()
+    cached_bytes = batch_size * num_frames * num_tokens * (2 * embed_dim) * cached_layers * element_size
+    return cached_bytes / (1024**3)
+
+
+def estimate_output_gb(images: torch.Tensor) -> dict[str, float]:
+    if images.dim() == 4:
+        num_frames, num_channels, height, width = images.shape
+        batch_size = 1
+    elif images.dim() == 5:
+        batch_size, num_frames, num_channels, height, width = images.shape
+    else:
+        return {}
+
+    fp32_size = torch.empty((), dtype=torch.float32).element_size()
+    return {
+        "images": batch_size * num_frames * num_channels * height * width * fp32_size / (1024**3),
+        "depth": batch_size * num_frames * height * width * fp32_size / (1024**3),
+        "depth_conf": batch_size * num_frames * height * width * fp32_size / (1024**3),
+        "pose_enc": batch_size * num_frames * 9 * fp32_size / (1024**3),
+        "camera_and_register_tokens": batch_size * num_frames * 17 * 2048 * fp32_size / (1024**3),
+    }
+
+
+def placement_summary(
+    model: VGGTOmega,
+    images: torch.Tensor,
+    devices: list[torch.device],
+    stage_splits: list[int],
+    stage_devices: list[str],
+    cache_device: str,
+    head_device: str,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    return {
+        "devices": [str(device) for device in devices],
+        "stage_devices": stage_devices,
+        "stage_splits": stage_splits,
+        "cache_device": cache_device,
+        "head_device": head_device,
+        "input_device": args.input_device,
+        "patch_embed_chunk_size": args.patch_embed_chunk_size,
+        "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
+        "parameter_memory_gb_by_class": parameter_memory_classes(model, stage_splits),
+        "estimated_cached_aggregator_outputs_gb": estimate_cached_aggregator_output_gb(model, images),
+        "estimated_output_tensors_gb": estimate_output_gb(images),
+    }
+
+
 def tensor_shapes(outputs: dict[str, Any]) -> dict[str, list[int]]:
     shapes: dict[str, list[int]] = {}
     for key, value in outputs.items():
@@ -464,6 +569,16 @@ def run_pipeline_memory_parallel(
         cache_device = args.cache_device
         stage_devices = [str(device) for device in devices]
         head_device = str(devices[args.head_device_index]) if args.head_device_index is not None else str(devices[-1])
+    placement = placement_summary(
+        model,
+        images,
+        devices,
+        stage_splits,
+        stage_devices,
+        cache_device,
+        head_device,
+        args,
+    )
     reset_memory_stats(devices)
     start = time.perf_counter()
     with torch.inference_mode():
@@ -488,6 +603,7 @@ def run_pipeline_memory_parallel(
         "patch_embed_chunk_size": args.patch_embed_chunk_size,
         "input_device": args.input_device,
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
+        "placement": placement,
         "elapsed_sec": elapsed,
         "memory": memory_summary(devices),
         "output_shapes": tensor_shapes(outputs),
