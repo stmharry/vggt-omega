@@ -199,6 +199,21 @@ Available modes are:
 - `capacity`: runs any inference mode over a comma-separated `--frame-counts`
   list and stops at the first CUDA OOM.
 
+Current context-parallel validation on `mv-53`:
+
+- `gather-sdpa` with `--sdpa-backend flash_math` passed real Titus-frame parity
+  for 3, 10, and 25 frames on `pose_enc`, `depth`, `depth_conf`, and
+  `camera_and_register_tokens`.
+- Four-way attention splitting failed the same parity gate; two-way attention
+  splitting remained parity-safe while four GPUs were still usable for aggregator
+  stage placement.
+- On synthetic 416x624 capacity with four 5090s, `gather-sdpa` completed 600
+  frames and OOMed at 700, matching the current placement-only ceiling rather
+  than improving it. The OOM was in retained stage activations/K/V materialized
+  for SDPA, so a useful next step would need a fused/ring context-attention
+  kernel that preserves SDPA-like numerics without gathering full K/V per query
+  shard.
+
 ## License
 
 See the [LICENSE](./LICENSE) file for details about the license under which
