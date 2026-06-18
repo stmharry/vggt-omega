@@ -201,6 +201,36 @@ def parse_args() -> argparse.Namespace:
         help="Query rows per block for --query-blockwise-devices.",
     )
     parser.add_argument(
+        "--context-parallel-devices",
+        help=(
+            "Comma-separated visible CUDA indices used for exact sequence/context-parallel "
+            "aggregator global inter-frame attention. Unlike --query-blockwise-devices, this "
+            "assigns Q/K/V sequence shards to the selected devices before running the chosen context implementation."
+        ),
+    )
+    parser.add_argument(
+        "--context-query-block-size",
+        type=int,
+        default=8192,
+        help="Query rows per streaming block for --context-parallel-devices.",
+    )
+    parser.add_argument(
+        "--context-key-block-size",
+        type=int,
+        default=4096,
+        help="Key/value rows per streaming block for --context-parallel-devices.",
+    )
+    parser.add_argument(
+        "--context-attention-implementation",
+        choices=("gather-sdpa", "online"),
+        default="gather-sdpa",
+        help=(
+            "Exact context attention implementation. gather-sdpa shards Q/K/V then gathers K/V "
+            "per query shard and delegates exact dense attention to PyTorch SDPA; online streams "
+            "K/V blocks with a custom log-sum-exp combine for lower transient K/V memory."
+        ),
+    )
+    parser.add_argument(
         "--sdpa-backend",
         choices=("auto", "efficient", "flash_math", "math"),
         default="auto",
@@ -344,6 +374,15 @@ def apply_auto_plan_runtime_defaults(args: argparse.Namespace) -> None:
         args.head_device_index = 0
     if args.sdpa_backend == "auto":
         args.sdpa_backend = parse_sdpa_backends(args.auto_plan_sdpa_backends)[0]
+
+
+def validate_attention_parallel_args(args: argparse.Namespace) -> None:
+    if args.query_blockwise_devices and args.context_parallel_devices:
+        raise ValueError("--query-blockwise-devices and --context-parallel-devices are mutually exclusive.")
+    if args.context_query_block_size <= 0:
+        raise ValueError("--context-query-block-size must be positive")
+    if args.context_key_block_size <= 0:
+        raise ValueError("--context-key-block-size must be positive")
 
 
 def sorted_image_paths(image_dir: pathlib.Path, limit_frames: int | None) -> list[pathlib.Path]:
@@ -610,7 +649,7 @@ def choose_query_devices(
     inventory: list[dict[str, Any]],
     args: argparse.Namespace,
 ) -> list[torch.device]:
-    if args.auto_plan_query_shards == "off" or len(devices) < 3:
+    if args.context_parallel_devices or args.auto_plan_query_shards == "off" or len(devices) < 3:
         return []
     if args.query_blockwise_devices:
         return parse_optional_cuda_devices(args.query_blockwise_devices)
@@ -671,10 +710,23 @@ def auto_pipeline_plan(
             "output_device": "cpu",
             "stage_devices": [str(device) for device in stage_devices],
             "query_worker_devices": [str(device) for device in query_devices],
+            "context_parallel_devices": (
+                [str(device) for device in parse_optional_cuda_devices(args.context_parallel_devices)]
+                if args.context_parallel_devices
+                else []
+            ),
         },
         "stage_splits": stage_splits,
         "stage_block_counts": stage_block_counts,
         "query_block_size": args.query_block_size,
+        "context_parallel_devices": (
+            [str(device) for device in parse_optional_cuda_devices(args.context_parallel_devices)]
+            if args.context_parallel_devices
+            else []
+        ),
+        "context_query_block_size": args.context_query_block_size,
+        "context_key_block_size": args.context_key_block_size,
+        "context_attention_implementation": args.context_attention_implementation,
         "sdpa_backend": args.sdpa_backend,
         "rationale": (
             "Auto-plan keeps inputs/cached outputs/final outputs on CPU, reserves the first CUDA device "
@@ -693,6 +745,7 @@ def placement_summary(
     cache_device: str,
     head_device: str,
     query_blockwise_devices: list[str],
+    context_parallel_devices: list[str],
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     return {
@@ -706,6 +759,10 @@ def placement_summary(
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
         "query_blockwise_devices": query_blockwise_devices,
         "query_block_size": args.query_block_size,
+        "context_parallel_devices": context_parallel_devices,
+        "context_query_block_size": args.context_query_block_size,
+        "context_key_block_size": args.context_key_block_size,
+        "context_attention_implementation": args.context_attention_implementation,
         "sdpa_backend": args.sdpa_backend,
         "parameter_memory_gb_by_class": parameter_memory_classes(model, stage_splits),
         "estimated_cached_aggregator_outputs_gb": estimate_cached_aggregator_output_gb(model, images),
@@ -897,10 +954,20 @@ def run_pipeline_memory_parallel(
         head_device_index=args.head_device_index,
     )
     query_blockwise_devices = parse_optional_cuda_devices(args.query_blockwise_devices)
+    context_parallel_devices = parse_optional_cuda_devices(args.context_parallel_devices)
+    if query_blockwise_devices and context_parallel_devices:
+        raise ValueError("--query-blockwise-devices and --context-parallel-devices are mutually exclusive.")
     if query_blockwise_devices:
         model.enable_global_inter_frame_query_blockwise_parallelism(
             query_blockwise_devices,
             query_block_size=args.query_block_size,
+        )
+    if context_parallel_devices:
+        model.enable_global_inter_frame_context_parallelism(
+            context_parallel_devices,
+            query_block_size=args.context_query_block_size,
+            key_block_size=args.context_key_block_size,
+            implementation=args.context_attention_implementation,
         )
     if args.cache_device is None:
         cache_device = str(devices[args.cache_device_index])
@@ -919,6 +986,7 @@ def run_pipeline_memory_parallel(
         cache_device,
         head_device,
         [str(device) for device in query_blockwise_devices],
+        [str(device) for device in context_parallel_devices],
         args,
     )
     summary = {
@@ -941,6 +1009,10 @@ def run_pipeline_memory_parallel(
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
         "query_blockwise_devices": [str(device) for device in query_blockwise_devices],
         "query_block_size": args.query_block_size,
+        "context_parallel_devices": [str(device) for device in context_parallel_devices],
+        "context_query_block_size": args.context_query_block_size,
+        "context_key_block_size": args.context_key_block_size,
+        "context_attention_implementation": args.context_attention_implementation,
         "sdpa_backend": args.sdpa_backend,
         "planner": planner_summary,
         "placement": placement,
@@ -1001,6 +1073,10 @@ def run_plan(args: argparse.Namespace, devices: list[torch.device]) -> dict[str,
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
         "query_blockwise_devices": [str(device) for device in parse_optional_cuda_devices(args.query_blockwise_devices)],
         "query_block_size": args.query_block_size,
+        "context_parallel_devices": [str(device) for device in parse_optional_cuda_devices(args.context_parallel_devices)],
+        "context_query_block_size": args.context_query_block_size,
+        "context_key_block_size": args.context_key_block_size,
+        "context_attention_implementation": args.context_attention_implementation,
         "sdpa_backend": args.sdpa_backend,
         "planner": planner_summary,
     }
@@ -1142,6 +1218,10 @@ def compact_probe_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "stage_splits": candidate.get("stage_splits"),
         "query_blockwise_devices": candidate.get("query_blockwise_devices"),
         "query_block_size": candidate.get("query_block_size"),
+        "context_parallel_devices": candidate.get("context_parallel_devices"),
+        "context_query_block_size": candidate.get("context_query_block_size"),
+        "context_key_block_size": candidate.get("context_key_block_size"),
+        "context_attention_implementation": candidate.get("context_attention_implementation"),
         "single_memory": summary["single"].get("memory"),
         "candidate_memory": candidate.get("memory"),
         "parity": summary["parity"],
@@ -1203,6 +1283,18 @@ def run_compare_probe_subprocess(
     if args.query_blockwise_devices:
         command.extend(["--query-blockwise-devices", args.query_blockwise_devices])
     command.extend(["--query-block-size", str(args.query_block_size)])
+    if args.context_parallel_devices:
+        command.extend(["--context-parallel-devices", args.context_parallel_devices])
+    command.extend(
+        [
+            "--context-query-block-size",
+            str(args.context_query_block_size),
+            "--context-key-block-size",
+            str(args.context_key_block_size),
+            "--context-attention-implementation",
+            args.context_attention_implementation,
+        ]
+    )
 
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     try:
@@ -1386,6 +1478,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for VGGT-Omega multi-device profiling.")
     apply_auto_plan_runtime_defaults(args)
+    validate_attention_parallel_args(args)
     configure_sdpa_backend(args.sdpa_backend)
     devices = parse_cuda_devices(args.devices)
 

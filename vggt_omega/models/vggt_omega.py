@@ -55,6 +55,21 @@ class VGGTOmega(nn.Module):
             query_block_size=query_block_size,
         )
 
+    def enable_global_inter_frame_context_parallelism(
+        self,
+        devices: Sequence[str | torch.device],
+        *,
+        query_block_size: int = 8192,
+        key_block_size: int = 4096,
+        implementation: str = "gather-sdpa",
+    ) -> None:
+        self.aggregator.set_global_inter_frame_context_parallel_devices(
+            devices,
+            query_block_size=query_block_size,
+            key_block_size=key_block_size,
+            implementation=implementation,
+        )
+
     def enable_memory_parallelism(
         self,
         devices: Sequence[str | torch.device],

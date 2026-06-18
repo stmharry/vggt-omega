@@ -122,6 +122,22 @@ class Aggregator(nn.Module):
                 query_block_size=query_block_size,
             )
 
+    def set_global_inter_frame_context_parallel_devices(
+        self,
+        devices: Sequence[str | torch.device] | None,
+        *,
+        query_block_size: int = 8192,
+        key_block_size: int = 4096,
+        implementation: str = "gather-sdpa",
+    ) -> None:
+        for block, attention_type in zip(self.inter_frame_blocks, self.inter_frame_attention_types):
+            block.set_context_parallel_devices(
+                devices if attention_type == "global" else None,
+                query_block_size=query_block_size,
+                key_block_size=key_block_size,
+                implementation=implementation,
+            )
+
     def set_cache_device(self, device: str | torch.device | None) -> None:
         self.cache_device = None if device is None else torch.device(device)
 

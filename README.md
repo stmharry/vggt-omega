@@ -174,6 +174,16 @@ Available modes are:
   flash_math` for parity and capacity runs so the single-GPU reference and
   query-sharded candidate use flash attention where supported with math fallback
   for unsupported SDPA calls.
+  `--context-parallel-devices 0,1` enables the exact sequence/context-parallel
+  prototype for aggregator global inter-frame attention. The default
+  `--context-attention-implementation gather-sdpa` shards Q/K/V by sequence,
+  gathers the full K/V sequence per query shard, and delegates dense attention
+  to PyTorch SDPA; keep `--context-query-block-size 8192` for parity-sensitive
+  tests because smaller query blocks can select different SDPA numerics and
+  fail the 5e-3 drift gate. `--context-attention-implementation online` streams
+  K/V blocks with a custom log-sum-exp combine to reduce transient K/V memory,
+  but it is diagnostic only: current bf16 accumulation order drifts across
+  aggregator blocks and the Python block loop is too slow for high-frame runs.
 - `plan`: inspects visible CUDA devices, estimates token/cache/output/model memory
   classes, and emits the placement selected by `--auto-plan` without running the
   full model. `--auto-plan` can also be used with `compare`, `capacity`, and

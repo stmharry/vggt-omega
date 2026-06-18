@@ -89,6 +89,24 @@ class SelfAttentionBlock(nn.Module):
             raise TypeError(f"{type(self.attn).__name__} does not support blockwise query devices.")
         setter(devices, query_block_size=query_block_size)
 
+    def set_context_parallel_devices(
+        self,
+        devices: Sequence[str | torch.device] | None,
+        *,
+        query_block_size: int = 8192,
+        key_block_size: int = 4096,
+        implementation: str = "gather-sdpa",
+    ) -> None:
+        setter = getattr(self.attn, "set_context_parallel_devices", None)
+        if setter is None:
+            raise TypeError(f"{type(self.attn).__name__} does not support context-parallel devices.")
+        setter(
+            devices,
+            query_block_size=query_block_size,
+            key_block_size=key_block_size,
+            implementation=implementation,
+        )
+
     @staticmethod
     def _maybe_index_rope(rope: tuple[Tensor, Tensor] | None, indices: Tensor) -> tuple[Tensor, Tensor] | None:
         if rope is None:

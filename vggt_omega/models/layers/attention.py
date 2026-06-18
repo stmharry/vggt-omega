@@ -82,6 +82,10 @@ class SelfAttention(nn.Module):
         self.head_parallel_devices: tuple[torch.device, ...] = ()
         self.query_blockwise_devices: tuple[torch.device, ...] = ()
         self.query_block_size = 2048
+        self.context_parallel_devices: tuple[torch.device, ...] = ()
+        self.context_query_block_size = 8192
+        self.context_key_block_size = 4096
+        self.context_attention_implementation = "gather-sdpa"
 
     def set_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
         if devices is None:
@@ -123,6 +127,42 @@ class SelfAttention(nn.Module):
                 raise ValueError(f"Blockwise query attention requires CUDA devices, got {device}.")
         self.query_blockwise_devices = parsed_devices
         self.query_block_size = query_block_size
+
+    def set_context_parallel_devices(
+        self,
+        devices: Sequence[str | torch.device] | None,
+        *,
+        query_block_size: int = 8192,
+        key_block_size: int = 4096,
+        implementation: str = "gather-sdpa",
+    ) -> None:
+        if devices is None:
+            self.context_parallel_devices = ()
+            return
+        parsed_devices = tuple(torch.device(device) for device in devices)
+        if len(parsed_devices) <= 1:
+            self.context_parallel_devices = ()
+            return
+        if query_block_size <= 0:
+            raise ValueError(
+                f"Context-parallel attention requires a positive query_block_size, got {query_block_size}."
+            )
+        if key_block_size <= 0:
+            raise ValueError(
+                f"Context-parallel attention requires a positive key_block_size, got {key_block_size}."
+            )
+        for device in parsed_devices:
+            if device.type != "cuda":
+                raise ValueError(f"Context-parallel attention requires CUDA devices, got {device}.")
+        if implementation not in {"gather-sdpa", "online"}:
+            raise ValueError(
+                "Context-parallel attention implementation must be 'gather-sdpa' or 'online', "
+                f"got {implementation!r}."
+            )
+        self.context_parallel_devices = parsed_devices
+        self.context_query_block_size = query_block_size
+        self.context_key_block_size = key_block_size
+        self.context_attention_implementation = implementation
 
     def apply_rope(self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
@@ -177,7 +217,9 @@ class SelfAttention(nn.Module):
             k = self.k_norm(k)
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
-        if self.query_blockwise_devices:
+        if self.context_parallel_devices:
+            x = self.compute_context_parallel_attention(q, k, v)
+        elif self.query_blockwise_devices:
             x = self.compute_query_blockwise_attention(q, k, v)
         elif self.head_parallel_devices:
             x = self.compute_head_parallel_attention(q, k, v)
@@ -185,6 +227,122 @@ class SelfAttention(nn.Module):
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])
+
+    def compute_context_parallel_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        source_device = q.device
+        attention_dtype = (
+            torch.get_autocast_dtype("cuda")
+            if q.device.type == "cuda" and torch.is_autocast_enabled("cuda")
+            else q.dtype
+        )
+        device_count = len(self.context_parallel_devices)
+        q_shards = torch.tensor_split(q, device_count, dim=2)
+        k_shards = torch.tensor_split(k, device_count, dim=2)
+        v_shards = torch.tensor_split(v, device_count, dim=2)
+        k_devices = [
+            shard.to(device=device, dtype=attention_dtype, non_blocking=True).contiguous()
+            for device, shard in zip(self.context_parallel_devices, k_shards)
+        ]
+        v_devices = [
+            shard.to(device=device, dtype=attention_dtype, non_blocking=True).contiguous()
+            for device, shard in zip(self.context_parallel_devices, v_shards)
+        ]
+
+        outputs: list[Tensor] = []
+        for device, q_shard in zip(self.context_parallel_devices, q_shards):
+            if q_shard.shape[2] == 0:
+                outputs.append(q_shard.to(device=source_device, dtype=attention_dtype))
+                continue
+
+            if self.context_attention_implementation == "gather-sdpa":
+                output = self._compute_context_query_shard_with_sdpa(
+                    q_shard,
+                    k_devices,
+                    v_devices,
+                    device,
+                    attention_dtype,
+                )
+            else:
+                q_device = q_shard.to(device=device, dtype=attention_dtype, non_blocking=True).contiguous()
+                q_outputs = []
+                for q_block in q_device.split(self.context_query_block_size, dim=2):
+                    q_outputs.append(self._compute_context_query_block_online(q_block, k_devices, v_devices, device))
+                output = torch.cat(q_outputs, dim=2)
+            outputs.append(output.to(device=source_device, non_blocking=True))
+        return torch.cat(outputs, dim=2)
+
+    def _compute_context_query_shard_with_sdpa(
+        self,
+        q_shard: Tensor,
+        k_shards: Sequence[Tensor],
+        v_shards: Sequence[Tensor],
+        device: torch.device,
+        attention_dtype: torch.dtype,
+    ) -> Tensor:
+        q_device = q_shard.to(device=device, dtype=attention_dtype, non_blocking=True).contiguous()
+        k_device = torch.cat([shard.to(device=device, non_blocking=True) for shard in k_shards], dim=2).contiguous()
+        v_device = torch.cat([shard.to(device=device, non_blocking=True) for shard in v_shards], dim=2).contiguous()
+        outputs = []
+        for q_block in q_device.split(self.context_query_block_size, dim=2):
+            outputs.append(F.scaled_dot_product_attention(q_block, k_device, v_device))
+        return torch.cat(outputs, dim=2)
+
+    def _compute_context_query_block_online(
+        self,
+        q_block: Tensor,
+        k_shards: Sequence[Tensor],
+        v_shards: Sequence[Tensor],
+        device: torch.device,
+    ) -> Tensor:
+        q_float = q_block.to(dtype=torch.float32)
+        batch_size, num_heads, query_count, head_dim = q_float.shape
+        acc = torch.zeros(
+            batch_size,
+            num_heads,
+            query_count,
+            head_dim,
+            device=device,
+            dtype=torch.float32,
+        )
+        normalizer = torch.zeros(
+            batch_size,
+            num_heads,
+            query_count,
+            1,
+            device=device,
+            dtype=torch.float32,
+        )
+        running_max = torch.full(
+            (batch_size, num_heads, query_count, 1),
+            -torch.inf,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        for k_shard, v_shard in zip(k_shards, v_shards):
+            if k_shard.shape[2] == 0:
+                continue
+            k_device = k_shard.to(device=device, non_blocking=True)
+            v_device = v_shard.to(device=device, non_blocking=True)
+            for k_block, v_block in zip(
+                k_device.split(self.context_key_block_size, dim=2),
+                v_device.split(self.context_key_block_size, dim=2),
+            ):
+                k_float = k_block.to(dtype=torch.float32)
+                v_float = v_block.to(dtype=torch.float32)
+                scores = torch.matmul(q_float, k_float.transpose(-2, -1)) * self.scale
+                block_max = scores.max(dim=-1, keepdim=True).values
+                new_max = torch.maximum(running_max, block_max)
+                old_weight = torch.exp(running_max - new_max)
+                block_weight = torch.exp(block_max - new_max)
+                probabilities = torch.exp(scores - block_max)
+                block_normalizer = probabilities.sum(dim=-1, keepdim=True)
+                block_acc = torch.matmul(probabilities, v_float)
+                acc = acc * old_weight + block_acc * block_weight
+                normalizer = normalizer * old_weight + block_normalizer * block_weight
+                running_max = new_max
+
+        return (acc / normalizer.clamp_min(torch.finfo(torch.float32).tiny)).to(dtype=q_block.dtype)
 
     def compute_query_blockwise_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         source_device = q.device
