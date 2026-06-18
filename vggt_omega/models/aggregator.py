@@ -81,6 +81,7 @@ class Aggregator(nn.Module):
         self.patch_size = patch_size
         self.cached_layer_indices = set(cached_layer_indices)
         self.cache_device: torch.device | None = None
+        self.patch_embed_chunk_size: int | None = None
         self.stage_devices: tuple[torch.device, ...] = ()
         self.stage_split_blocks: tuple[int, ...] = ()
         self.camera_token = nn.Parameter(torch.empty(1, 2, 1, embed_dim))
@@ -112,6 +113,11 @@ class Aggregator(nn.Module):
     def set_cache_device(self, device: str | torch.device | None) -> None:
         self.cache_device = None if device is None else torch.device(device)
 
+    def set_patch_embed_chunk_size(self, chunk_size: int | None) -> None:
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError(f"patch_embed_chunk_size must be positive, got {chunk_size}.")
+        self.patch_embed_chunk_size = chunk_size
+
     def set_stage_devices(
         self,
         primary_device: str | torch.device,
@@ -140,11 +146,13 @@ class Aggregator(nn.Module):
                 "Pipeline memory-parallel inference requires exactly one fewer split "
                 f"than stage devices, got devices={len(parsed_stage_devices)} splits={len(split_blocks)}."
             )
-        if any(device.type != "cuda" for device in parsed_stage_devices) or parsed_cache_device.type != "cuda":
+        if any(device.type != "cuda" for device in parsed_stage_devices):
             raise ValueError(
-                "Pipeline memory-parallel inference requires CUDA devices, "
+                "Pipeline memory-parallel inference requires CUDA stage devices, "
                 f"got stage_devices={parsed_stage_devices}, cache_device={parsed_cache_device}."
             )
+        if parsed_cache_device.type not in {"cuda", "cpu"}:
+            raise ValueError(f"Pipeline cache device must be CUDA or CPU, got {parsed_cache_device}.")
         parsed_split_blocks = tuple(int(split_block) for split_block in split_blocks)
         if tuple(sorted(parsed_split_blocks)) != parsed_split_blocks or len(set(parsed_split_blocks)) != len(
             parsed_split_blocks
@@ -170,15 +178,16 @@ class Aggregator(nn.Module):
         if num_channels != 3:
             raise ValueError(f"Expected 3 input channels, got {num_channels}")
 
-        images = (images - self._resnet_mean) / self._resnet_std
-        images = images.view(batch_size * num_frames, num_channels, height, width)
+        patch_tokens = self._run_patch_embed(images, batch_size, num_frames)
+        first_block_device = self._stage_device_for_block(0)
+        if patch_tokens.device != first_block_device:
+            patch_tokens = patch_tokens.to(device=first_block_device, non_blocking=True)
 
         camera_token = slice_expand_and_flatten(self.camera_token, batch_size, num_frames)
         register_token = slice_expand_and_flatten(self.register_token, batch_size, num_frames)
-
-        patch_tokens = self.patch_embed(images)
-        if isinstance(patch_tokens, dict):
-            patch_tokens = patch_tokens["x_norm_patchtokens"]
+        if camera_token.device != first_block_device:
+            camera_token = camera_token.to(device=first_block_device, non_blocking=True)
+            register_token = register_token.to(device=first_block_device, non_blocking=True)
 
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
         _, num_tokens, embed_dim = tokens.shape
@@ -187,8 +196,8 @@ class Aggregator(nn.Module):
         with torch.no_grad():
             rope_sin, rope_cos = self.rope_embed(H=patch_grid_size[0], W=patch_grid_size[1])
             frame_rope = (
-                rope_sin.to(device=patch_tokens.device, dtype=torch.float32),
-                rope_cos.to(device=patch_tokens.device, dtype=torch.float32),
+                rope_sin.to(device=first_block_device, dtype=torch.float32),
+                rope_cos.to(device=first_block_device, dtype=torch.float32),
             )
 
         outputs = []
@@ -227,6 +236,31 @@ class Aggregator(nn.Module):
                 outputs.append(None)
 
         return outputs, self.patch_token_start
+
+    def _run_patch_embed(self, images: torch.Tensor, batch_size: int, num_frames: int) -> torch.Tensor:
+        _, _, num_channels, height, width = images.shape
+        patch_device = next(self.patch_embed.parameters()).device
+        flat_images = images.view(batch_size * num_frames, num_channels, height, width)
+        mean = self._resnet_mean.view(1, 3, 1, 1).to(device=patch_device)
+        std = self._resnet_std.view(1, 3, 1, 1).to(device=patch_device)
+
+        if self.patch_embed_chunk_size is None or self.patch_embed_chunk_size >= flat_images.shape[0]:
+            normalized_images = flat_images.to(device=patch_device, non_blocking=True)
+            normalized_images = (normalized_images - mean) / std
+            return self._call_patch_embed(normalized_images)
+
+        patch_token_chunks = []
+        for image_chunk in flat_images.split(self.patch_embed_chunk_size, dim=0):
+            image_chunk = image_chunk.to(device=patch_device, non_blocking=True)
+            image_chunk = (image_chunk - mean) / std
+            patch_token_chunks.append(self._call_patch_embed(image_chunk))
+        return torch.cat(patch_token_chunks, dim=0)
+
+    def _call_patch_embed(self, images: torch.Tensor) -> torch.Tensor:
+        patch_tokens = self.patch_embed(images)
+        if isinstance(patch_tokens, dict):
+            return patch_tokens["x_norm_patchtokens"]
+        return patch_tokens
 
     def _stage_device_for_block(self, block_idx: int) -> torch.device:
         if not self.stage_devices:

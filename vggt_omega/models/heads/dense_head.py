@@ -68,6 +68,10 @@ class DenseHead(nn.Module):
             self.final_shuffle_factor**2,
         )
         _init_small_conf_prediction_head(self.proj_conf)
+        self.output_device: torch.device | None = None
+
+    def set_output_device(self, device: str | torch.device | None) -> None:
+        self.output_device = None if device is None else torch.device(device)
 
     def forward(
         self,
@@ -98,6 +102,9 @@ class DenseHead(nn.Module):
                 frames_start_idx,
                 frames_end_idx,
             )
+            if self.output_device is not None:
+                depth_chunk = depth_chunk.to(device=self.output_device, non_blocking=True)
+                depth_conf_chunk = depth_conf_chunk.to(device=self.output_device, non_blocking=True)
             depth_chunks.append(depth_chunk)
             depth_conf_chunks.append(depth_conf_chunk)
 
@@ -126,6 +133,9 @@ class DenseHead(nn.Module):
             x = x[:, :, patch_token_start:]
             if frames_start_idx is not None and frames_end_idx is not None:
                 x = x[:, frames_start_idx:frames_end_idx]
+            head_device = next(self.parameters()).device
+            if x.device != head_device:
+                x = x.to(device=head_device, non_blocking=True)
             if x.dtype != torch.float32:
                 x = x.float()
 
@@ -156,6 +166,10 @@ class DenseHead(nn.Module):
 
         if depth.dtype != torch.float32 or depth_conf.dtype != torch.float32:
             raise TypeError(f"DenseHead outputs must be fp32, got depth={depth.dtype}, conf={depth_conf.dtype}")
+
+        if self.output_device is not None:
+            depth = depth.to(device=self.output_device, non_blocking=True)
+            depth_conf = depth_conf.to(device=self.output_device, non_blocking=True)
 
         return depth, depth_conf
 

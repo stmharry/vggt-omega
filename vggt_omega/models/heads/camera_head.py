@@ -63,10 +63,12 @@ class CameraHead(nn.Module):
         if patch_token_start > num_tokens:
             raise ValueError(f"patch_token_start ({patch_token_start}) exceeds token length ({num_tokens})")
 
-        if tokens.dtype != torch.float32:
-            tokens = tokens.float()
-
         camera_and_register_tokens = tokens[:, :, :patch_token_start]
+        head_device = next(self.parameters()).device
+        if camera_and_register_tokens.device != head_device:
+            camera_and_register_tokens = camera_and_register_tokens.to(device=head_device, non_blocking=True)
+        if camera_and_register_tokens.dtype != torch.float32:
+            camera_and_register_tokens = camera_and_register_tokens.float()
         camera_and_register_tokens = self.token_norm(camera_and_register_tokens)
 
         camera_and_register_tokens = camera_and_register_tokens.reshape(batch_size, num_frames * patch_token_start, -1)

@@ -143,6 +143,38 @@ def parse_args() -> argparse.Namespace:
         help="Index into --devices used for cached outputs and heads in pipeline-memory-parallel.",
     )
     parser.add_argument(
+        "--cache-device",
+        help=(
+            "Explicit cache device for pipeline-memory-parallel. Use 'cpu' to offload cached "
+            "aggregator layers and keep every CUDA device available as a pipeline stage. "
+            "When omitted, --cache-device-index preserves the original behavior."
+        ),
+    )
+    parser.add_argument(
+        "--head-device-index",
+        type=int,
+        help=(
+            "Index into --devices used for camera/depth/text heads in pipeline-memory-parallel. "
+            "Defaults to the cache GPU, or the last CUDA device when --cache-device=cpu."
+        ),
+    )
+    parser.add_argument(
+        "--patch-embed-chunk-size",
+        type=int,
+        help="Optional frame chunk size for patch embedding to reduce primary-device transient memory.",
+    )
+    parser.add_argument(
+        "--input-device",
+        choices=("primary", "cpu"),
+        default="primary",
+        help="Where to keep loaded inputs before model forward. 'cpu' lets the model stage image chunks onto CUDA.",
+    )
+    parser.add_argument(
+        "--offload-outputs-to-cpu",
+        action="store_true",
+        help="Move returned tensors to CPU during pipeline-memory-parallel inference to reduce retained GPU output memory.",
+    )
+    parser.add_argument(
         "--frame-counts",
         default="50,100,200,300,400",
         help="Comma-separated frame counts for capacity mode.",
@@ -204,6 +236,8 @@ def load_images(args: argparse.Namespace, primary_device: torch.device) -> torch
             mode=args.preprocess_mode,
             image_resolution=args.image_resolution,
         )
+    if args.input_device == "cpu":
+        return images
     return images.to(device=primary_device, non_blocking=True)
 
 
@@ -411,12 +445,25 @@ def run_pipeline_memory_parallel(
     primary_device = devices[0]
     stage_splits = parse_stage_splits(args.stage_splits)
     model = load_model(args, primary_device)
+    model.set_patch_embed_chunk_size(args.patch_embed_chunk_size)
+    if args.offload_outputs_to_cpu:
+        model.set_output_device("cpu")
+    cache_device_index = None if args.cache_device is not None else args.cache_device_index
     model.enable_pipeline_memory_parallelism(
         devices,
         stage_splits=stage_splits,
-        cache_device_index=args.cache_device_index,
+        cache_device_index=cache_device_index,
+        cache_device=args.cache_device,
+        head_device_index=args.head_device_index,
     )
-    stage_devices = [str(device) for index, device in enumerate(devices) if index != args.cache_device_index]
+    if args.cache_device is None:
+        cache_device = str(devices[args.cache_device_index])
+        stage_devices = [str(device) for index, device in enumerate(devices) if index != args.cache_device_index]
+        head_device = str(devices[args.head_device_index]) if args.head_device_index is not None else cache_device
+    else:
+        cache_device = args.cache_device
+        stage_devices = [str(device) for device in devices]
+        head_device = str(devices[args.head_device_index]) if args.head_device_index is not None else str(devices[-1])
     reset_memory_stats(devices)
     start = time.perf_counter()
     with torch.inference_mode():
@@ -436,7 +483,11 @@ def run_pipeline_memory_parallel(
         "devices": [str(device) for device in devices],
         "stage_devices": stage_devices,
         "stage_splits": stage_splits,
-        "cache_device": str(devices[args.cache_device_index]),
+        "cache_device": cache_device,
+        "head_device": head_device,
+        "patch_embed_chunk_size": args.patch_embed_chunk_size,
+        "input_device": args.input_device,
+        "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
         "elapsed_sec": elapsed,
         "memory": memory_summary(devices),
         "output_shapes": tensor_shapes(outputs),
