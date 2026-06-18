@@ -80,6 +80,9 @@ class SelfAttention(nn.Module):
         self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
         self.proj_drop = nn.Dropout(proj_drop)
         self.head_parallel_devices: tuple[torch.device, ...] = ()
+        self.query_blockwise_devices: tuple[torch.device, ...] = ()
+        self.query_block_size = 2048
+        self.key_block_size = 4096
 
     def set_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
         if devices is None:
@@ -98,6 +101,32 @@ class SelfAttention(nn.Module):
             if device.type != "cuda":
                 raise ValueError(f"Head-parallel attention requires CUDA devices, got {device}.")
         self.head_parallel_devices = parsed_devices
+
+    def set_query_blockwise_devices(
+        self,
+        devices: Sequence[str | torch.device] | None,
+        *,
+        query_block_size: int = 2048,
+        key_block_size: int = 4096,
+    ) -> None:
+        if devices is None:
+            self.query_blockwise_devices = ()
+            return
+        parsed_devices = tuple(torch.device(device) for device in devices)
+        if len(parsed_devices) <= 1:
+            self.query_blockwise_devices = ()
+            return
+        if query_block_size <= 0 or key_block_size <= 0:
+            raise ValueError(
+                f"Blockwise query attention requires positive block sizes, got "
+                f"query_block_size={query_block_size}, key_block_size={key_block_size}."
+            )
+        for device in parsed_devices:
+            if device.type != "cuda":
+                raise ValueError(f"Blockwise query attention requires CUDA devices, got {device}.")
+        self.query_blockwise_devices = parsed_devices
+        self.query_block_size = query_block_size
+        self.key_block_size = key_block_size
 
     def apply_rope(self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
@@ -152,12 +181,51 @@ class SelfAttention(nn.Module):
             k = self.k_norm(k)
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
-        if self.head_parallel_devices:
+        if self.query_blockwise_devices:
+            x = self.compute_query_blockwise_attention(q, k, v)
+        elif self.head_parallel_devices:
             x = self.compute_head_parallel_attention(q, k, v)
         else:
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])
+
+    def compute_query_blockwise_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        source_device = q.device
+        q_shards = torch.chunk(q, len(self.query_blockwise_devices), dim=2)
+        outputs: list[Tensor] = []
+        for device, q_shard in zip(self.query_blockwise_devices, q_shards):
+            k_device = k.to(device=device)
+            v_device = v.to(device=device)
+            shard_outputs = []
+            for q_block in q_shard.split(self.query_block_size, dim=2):
+                q_block = q_block.to(device=device)
+                output = self.compute_query_block(q_block, k_device, v_device)
+                shard_outputs.append(output.to(device=source_device))
+            outputs.append(torch.cat(shard_outputs, dim=2))
+        return torch.cat(outputs, dim=2)
+
+    def compute_query_block(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        compute_dtype = torch.float32
+        q_float = q.to(dtype=compute_dtype)
+        output = torch.zeros_like(q_float)
+        normalizer = torch.zeros((*q_float.shape[:-1], 1), dtype=compute_dtype, device=q.device)
+        row_max = torch.full_like(normalizer, -torch.inf)
+        scale = self.scale
+
+        for k_block, v_block in zip(k.split(self.key_block_size, dim=2), v.split(self.key_block_size, dim=2)):
+            k_float = k_block.to(device=q.device, dtype=compute_dtype)
+            v_float = v_block.to(device=q.device, dtype=compute_dtype)
+            scores = torch.matmul(q_float, k_float.transpose(-2, -1)) * scale
+            block_max = scores.max(dim=-1, keepdim=True).values
+            next_row_max = torch.maximum(row_max, block_max)
+            old_scale = torch.exp(row_max - next_row_max)
+            score_exp = torch.exp(scores - next_row_max)
+            output = output * old_scale + torch.matmul(score_exp, v_float)
+            normalizer = normalizer * old_scale + score_exp.sum(dim=-1, keepdim=True)
+            row_max = next_row_max
+
+        return (output / normalizer).to(dtype=q.dtype)
 
     def compute_head_parallel_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         source_device = q.device

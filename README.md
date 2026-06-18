@@ -167,6 +167,10 @@ Available modes are:
   during inference. The JSON summary includes a `placement` object with parameter
   memory by class, estimated cached aggregator output size, and estimated output
   tensor size.
+  `--query-blockwise-devices 0,1,2,3` enables the exact blockwise query-sharded
+  prototype for aggregator global inter-frame attention. Query rows are split
+  across visible CUDA devices, each query block streams over all K/V blocks with
+  fp32 online softmax, and outputs are gathered in original sequence order.
 - `compare`: runs `single` and `--compare-mode`, then reports finite
   diagnostics, shape, and drift for `pose_enc`, `depth`, `depth_conf`, and
   `camera_and_register_tokens`.
