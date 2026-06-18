@@ -218,14 +218,16 @@ class SelfAttention(nn.Module):
             attn_v = torch.nn.functional.scaled_dot_product_attention(q, k, v)
             attn_v = attn_v.transpose(1, 2).reshape(B, N, column_end - column_start)
             proj_weight = self.proj.weight[:, column_start:column_end].to(device=device, non_blocking=True)
-            partial = F.linear(attn_v, proj_weight, None).to(device=source_device, non_blocking=True)
+            with torch.autocast(device_type=device.type, enabled=False):
+                partial = F.linear(attn_v.float(), proj_weight.float(), None)
+            partial = partial.to(device=source_device, non_blocking=True)
             output = partial if output is None else output + partial
 
         if output is None:
             raise RuntimeError("Projected head-parallel attention has no configured devices.")
         if self.proj.bias is not None:
             output = output + self.proj.bias.to(device=source_device, dtype=output.dtype)
-        return self.proj_drop(output)
+        return self.proj_drop(output.to(dtype=x.dtype))
 
     def _effective_qkv_bias(self) -> Tensor | None:
         if self.qkv.bias is None:
