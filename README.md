@@ -152,7 +152,8 @@ Available modes are:
   heads on that secondary GPU.
 - `balanced-memory-parallel`: keeps patch embedding and early aggregator blocks
   on the primary GPU, moves live tokens to the secondary GPU at `--split-block`,
-  and keeps cached outputs plus camera/depth heads on that secondary GPU.
+  and keeps cached outputs plus camera/depth heads on that secondary GPU. The
+  default split is 23 based on the current 2-GPU profiling sweep.
 - `compare`: runs `single` and `--compare-mode`, then reports finite
   diagnostics, shape, and drift for `pose_enc`, `depth`, `depth_conf`, and
   `camera_and_register_tokens`.

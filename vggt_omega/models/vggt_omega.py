@@ -66,7 +66,7 @@ class VGGTOmega(nn.Module):
         self,
         devices: Sequence[str | torch.device],
         *,
-        split_block: int = 12,
+        split_block: int = 23,
     ) -> None:
         parsed_devices = tuple(torch.device(device) for device in devices)
         if len(parsed_devices) < 2:

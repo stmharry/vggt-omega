@@ -119,7 +119,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split-block",
         type=int,
-        default=12,
+        default=23,
         help="Aggregator block index where balanced-memory-parallel moves live tokens to the secondary device.",
     )
     parser.add_argument(
