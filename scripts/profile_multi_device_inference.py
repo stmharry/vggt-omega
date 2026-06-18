@@ -33,7 +33,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("single", "head-parallel", "memory-parallel", "balanced-memory-parallel", "fsdp", "compare", "capacity"),
+        choices=(
+            "single",
+            "head-parallel",
+            "memory-parallel",
+            "balanced-memory-parallel",
+            "pipeline-memory-parallel",
+            "fsdp",
+            "compare",
+            "capacity",
+        ),
         default="single",
         help="Inference path to profile. compare runs single and the selected --compare-mode sequentially.",
     )
@@ -106,13 +115,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--capacity-mode",
-        choices=("single", "head-parallel", "memory-parallel", "balanced-memory-parallel"),
+        choices=("single", "head-parallel", "memory-parallel", "balanced-memory-parallel", "pipeline-memory-parallel"),
         default="memory-parallel",
         help="Inference path used by capacity mode.",
     )
     parser.add_argument(
         "--compare-mode",
-        choices=("head-parallel", "memory-parallel", "balanced-memory-parallel"),
+        choices=("head-parallel", "memory-parallel", "balanced-memory-parallel", "pipeline-memory-parallel"),
         default="memory-parallel",
         help="GPU-parallel inference path compared against single in compare mode.",
     )
@@ -121,6 +130,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=23,
         help="Aggregator block index where balanced-memory-parallel moves live tokens to the secondary device.",
+    )
+    parser.add_argument(
+        "--stage-splits",
+        default="8,16",
+        help="Comma-separated aggregator split blocks for pipeline-memory-parallel, e.g. 8,16.",
+    )
+    parser.add_argument(
+        "--cache-device-index",
+        type=int,
+        default=3,
+        help="Index into --devices used for cached outputs and heads in pipeline-memory-parallel.",
     )
     parser.add_argument(
         "--frame-counts",
@@ -149,6 +169,13 @@ def parse_frame_counts(value: str) -> list[int]:
     if any(count <= 0 for count in counts):
         raise ValueError("--frame-counts values must be positive")
     return counts
+
+
+def parse_stage_splits(value: str) -> list[int]:
+    splits = [int(part.strip()) for part in value.split(",") if part.strip()]
+    if not splits:
+        raise ValueError("--stage-splits must contain at least one split")
+    return splits
 
 
 def sorted_image_paths(image_dir: pathlib.Path, limit_frames: int | None) -> list[pathlib.Path]:
@@ -376,6 +403,47 @@ def run_balanced_memory_parallel(
     }
 
 
+def run_pipeline_memory_parallel(
+    args: argparse.Namespace,
+    images: torch.Tensor,
+    devices: list[torch.device],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    primary_device = devices[0]
+    stage_splits = parse_stage_splits(args.stage_splits)
+    model = load_model(args, primary_device)
+    model.enable_pipeline_memory_parallelism(
+        devices,
+        stage_splits=stage_splits,
+        cache_device_index=args.cache_device_index,
+    )
+    stage_devices = [str(device) for index, device in enumerate(devices) if index != args.cache_device_index]
+    reset_memory_stats(devices)
+    start = time.perf_counter()
+    with torch.inference_mode():
+        outputs = model(images)
+    synchronize(devices)
+    elapsed = time.perf_counter() - start
+    return outputs, {
+        "mode": "pipeline-memory-parallel",
+        "status": "completed",
+        "finding": (
+            "Aggregator blocks run across ordered stage CUDA devices with live tokens moved at "
+            "the requested split blocks; cached outputs and camera/dense heads run on the "
+            "configured cache CUDA device."
+        ),
+        "frame_count": int(images.shape[0]),
+        "image_shape": list(images.shape),
+        "devices": [str(device) for device in devices],
+        "stage_devices": stage_devices,
+        "stage_splits": stage_splits,
+        "cache_device": str(devices[args.cache_device_index]),
+        "elapsed_sec": elapsed,
+        "memory": memory_summary(devices),
+        "output_shapes": tensor_shapes(outputs),
+        "finite": output_finite_summary(outputs),
+    }
+
+
 def run_profile_mode(
     mode: str,
     args: argparse.Namespace,
@@ -390,6 +458,8 @@ def run_profile_mode(
         return run_memory_parallel(args, images, devices)
     if mode == "balanced-memory-parallel":
         return run_balanced_memory_parallel(args, images, devices)
+    if mode == "pipeline-memory-parallel":
+        return run_pipeline_memory_parallel(args, images, devices)
     raise AssertionError(f"Unhandled profile mode: {mode}")
 
 
@@ -567,7 +637,13 @@ def main() -> None:
         return
 
     images = load_images(args, devices[0])
-    if args.mode in {"single", "head-parallel", "memory-parallel", "balanced-memory-parallel"}:
+    if args.mode in {
+        "single",
+        "head-parallel",
+        "memory-parallel",
+        "balanced-memory-parallel",
+        "pipeline-memory-parallel",
+    }:
         _outputs, summary = run_profile_mode(args.mode, args, images, devices)
     elif args.mode == "compare":
         single_outputs, single_summary = run_single(args, images, devices)

@@ -81,8 +81,8 @@ class Aggregator(nn.Module):
         self.patch_size = patch_size
         self.cached_layer_indices = set(cached_layer_indices)
         self.cache_device: torch.device | None = None
-        self.stage_split_block: int | None = None
-        self.stage_device: torch.device | None = None
+        self.stage_devices: tuple[torch.device, ...] = ()
+        self.stage_split_blocks: tuple[int, ...] = ()
         self.camera_token = nn.Parameter(torch.empty(1, 2, 1, embed_dim))
         self.register_token = nn.Parameter(torch.empty(1, 2, num_register_tokens, embed_dim))
         self.patch_token_start = 1 + num_register_tokens
@@ -118,21 +118,47 @@ class Aggregator(nn.Module):
         stage_device: str | torch.device,
         split_block: int,
     ) -> None:
-        primary_device = torch.device(primary_device)
-        stage_device = torch.device(stage_device)
-        if primary_device.type != "cuda" or stage_device.type != "cuda":
-            raise ValueError(
-                "Balanced memory-parallel inference requires CUDA stage devices, "
-                f"got primary={primary_device}, stage={stage_device}."
-            )
-        if split_block < 0 or split_block > self.depth:
-            raise ValueError(f"split_block must be in [0, {self.depth}], got {split_block}.")
+        self.set_pipeline_stage_devices(
+            [primary_device, stage_device],
+            [split_block],
+            cache_device=stage_device,
+        )
 
-        self.stage_split_block = split_block
-        self.stage_device = stage_device
-        self.cache_device = stage_device
+    def set_pipeline_stage_devices(
+        self,
+        stage_devices: Sequence[str | torch.device],
+        split_blocks: Sequence[int],
+        *,
+        cache_device: str | torch.device,
+    ) -> None:
+        parsed_stage_devices = tuple(torch.device(device) for device in stage_devices)
+        parsed_cache_device = torch.device(cache_device)
+        if len(parsed_stage_devices) < 2:
+            raise ValueError("Pipeline memory-parallel inference requires at least two stage devices.")
+        if len(split_blocks) != len(parsed_stage_devices) - 1:
+            raise ValueError(
+                "Pipeline memory-parallel inference requires exactly one fewer split "
+                f"than stage devices, got devices={len(parsed_stage_devices)} splits={len(split_blocks)}."
+            )
+        if any(device.type != "cuda" for device in parsed_stage_devices) or parsed_cache_device.type != "cuda":
+            raise ValueError(
+                "Pipeline memory-parallel inference requires CUDA devices, "
+                f"got stage_devices={parsed_stage_devices}, cache_device={parsed_cache_device}."
+            )
+        parsed_split_blocks = tuple(int(split_block) for split_block in split_blocks)
+        if tuple(sorted(parsed_split_blocks)) != parsed_split_blocks or len(set(parsed_split_blocks)) != len(
+            parsed_split_blocks
+        ):
+            raise ValueError(f"split_blocks must be sorted and unique, got {parsed_split_blocks}.")
+        for split_block in parsed_split_blocks:
+            if split_block < 0 or split_block > self.depth:
+                raise ValueError(f"split_blocks must be in [0, {self.depth}], got {parsed_split_blocks}.")
+
+        self.stage_devices = parsed_stage_devices
+        self.stage_split_blocks = parsed_split_blocks
+        self.cache_device = parsed_cache_device
         for block_idx in range(self.depth):
-            block_device = stage_device if block_idx >= split_block else primary_device
+            block_device = self._stage_device_for_block(block_idx)
             self.frame_blocks[block_idx].to(device=block_device)
             self.inter_frame_blocks[block_idx].to(device=block_device)
 
@@ -167,13 +193,12 @@ class Aggregator(nn.Module):
 
         outputs = []
         for block_idx in range(self.depth):
-            if block_idx == self.stage_split_block:
-                if self.stage_device is None:
-                    raise RuntimeError("stage_device is required when stage_split_block is set.")
-                tokens = tokens.to(device=self.stage_device, non_blocking=True)
+            if block_idx in self.stage_split_blocks:
+                stage_device = self._stage_device_for_block(block_idx)
+                tokens = tokens.to(device=stage_device, non_blocking=True)
                 frame_rope = (
-                    frame_rope[0].to(device=self.stage_device, non_blocking=True),
-                    frame_rope[1].to(device=self.stage_device, non_blocking=True),
+                    frame_rope[0].to(device=stage_device, non_blocking=True),
+                    frame_rope[1].to(device=stage_device, non_blocking=True),
                 )
             tokens, frame_tokens = self._run_frame_block(
                 tokens,
@@ -202,6 +227,12 @@ class Aggregator(nn.Module):
                 outputs.append(None)
 
         return outputs, self.patch_token_start
+
+    def _stage_device_for_block(self, block_idx: int) -> torch.device:
+        if not self.stage_devices:
+            return next(self.frame_blocks[block_idx].parameters()).device
+        stage_index = sum(split_block <= block_idx for split_block in self.stage_split_blocks)
+        return self.stage_devices[stage_index]
 
     def _run_frame_block(
         self,

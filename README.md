@@ -154,12 +154,16 @@ Available modes are:
   on the primary GPU, moves live tokens to the secondary GPU at `--split-block`,
   and keeps cached outputs plus camera/depth heads on that secondary GPU. The
   default split is 23 based on the current 2-GPU profiling sweep.
+- `pipeline-memory-parallel`: runs aggregator blocks across ordered stage GPUs
+  split by `--stage-splits`, while cached outputs and camera/depth heads live on
+  `--cache-device-index`. For four visible devices, `--stage-splits 8,16` with
+  `--cache-device-index 3` uses devices 0/1/2 for aggregator stages and device
+  3 for cached outputs and heads.
 - `compare`: runs `single` and `--compare-mode`, then reports finite
   diagnostics, shape, and drift for `pose_enc`, `depth`, `depth_conf`, and
   `camera_and_register_tokens`.
-- `capacity`: runs `single`, `head-parallel`, `memory-parallel`, or
-  `balanced-memory-parallel` over a comma-separated `--frame-counts` list and
-  stops at the first CUDA OOM.
+- `capacity`: runs any inference mode over a comma-separated `--frame-counts`
+  list and stops at the first CUDA OOM.
 
 ## License
 

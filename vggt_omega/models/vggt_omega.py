@@ -86,6 +86,37 @@ class VGGTOmega(nn.Module):
         if self.text_alignment_head is not None:
             self.text_alignment_head.to(device=stage_device)
 
+    def enable_pipeline_memory_parallelism(
+        self,
+        devices: Sequence[str | torch.device],
+        *,
+        stage_splits: Sequence[int],
+        cache_device_index: int,
+    ) -> None:
+        parsed_devices = tuple(torch.device(device) for device in devices)
+        if len(parsed_devices) < 3:
+            raise ValueError("Pipeline memory-parallel inference requires at least three CUDA devices.")
+        if cache_device_index < 0 or cache_device_index >= len(parsed_devices):
+            raise ValueError(
+                f"cache_device_index must be in [0, {len(parsed_devices) - 1}], got {cache_device_index}."
+            )
+        if any(device.type != "cuda" for device in parsed_devices):
+            raise ValueError(f"Pipeline memory-parallel inference requires CUDA devices, got {parsed_devices}.")
+
+        cache_device = parsed_devices[cache_device_index]
+        stage_devices = tuple(device for index, device in enumerate(parsed_devices) if index != cache_device_index)
+        self.aggregator.set_pipeline_stage_devices(
+            stage_devices,
+            stage_splits,
+            cache_device=cache_device,
+        )
+        if self.camera_head is not None:
+            self.camera_head.to(device=cache_device)
+        if self.dense_head is not None:
+            self.dense_head.to(device=cache_device)
+        if self.text_alignment_head is not None:
+            self.text_alignment_head.to(device=cache_device)
+
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         if len(images.shape) == 4:
             images = images.unsqueeze(0)
