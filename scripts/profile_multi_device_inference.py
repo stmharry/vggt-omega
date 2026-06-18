@@ -175,15 +175,6 @@ def parse_args() -> argparse.Namespace:
         help="Move returned tensors to CPU during pipeline-memory-parallel inference to reduce retained GPU output memory.",
     )
     parser.add_argument(
-        "--pipeline-head-parallel",
-        choices=("none", "inter-frame", "inter-frame-and-camera"),
-        default="none",
-        help=(
-            "Optionally shard SDPA by attention heads inside pipeline-memory-parallel. "
-            "This targets live all-frame attention workspace without changing pipeline/cache placement."
-        ),
-    )
-    parser.add_argument(
         "--frame-counts",
         default="50,100,200,300,400",
         help="Comma-separated frame counts for capacity mode.",
@@ -382,7 +373,6 @@ def placement_summary(
         "input_device": args.input_device,
         "patch_embed_chunk_size": args.patch_embed_chunk_size,
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
-        "pipeline_head_parallel": args.pipeline_head_parallel,
         "parameter_memory_gb_by_class": parameter_memory_classes(model, stage_splits),
         "estimated_cached_aggregator_outputs_gb": estimate_cached_aggregator_output_gb(model, images),
         "estimated_output_tensors_gb": estimate_output_gb(images),
@@ -571,11 +561,6 @@ def run_pipeline_memory_parallel(
         cache_device=args.cache_device,
         head_device_index=args.head_device_index,
     )
-    if args.pipeline_head_parallel != "none":
-        model.enable_head_parallelism(
-            devices,
-            include_camera_head=args.pipeline_head_parallel == "inter-frame-and-camera",
-        )
     if args.cache_device is None:
         cache_device = str(devices[args.cache_device_index])
         stage_devices = [str(device) for index, device in enumerate(devices) if index != args.cache_device_index]
@@ -618,7 +603,6 @@ def run_pipeline_memory_parallel(
         "patch_embed_chunk_size": args.patch_embed_chunk_size,
         "input_device": args.input_device,
         "offload_outputs_to_cpu": bool(args.offload_outputs_to_cpu),
-        "pipeline_head_parallel": args.pipeline_head_parallel,
         "placement": placement,
         "elapsed_sec": elapsed,
         "memory": memory_summary(devices),
