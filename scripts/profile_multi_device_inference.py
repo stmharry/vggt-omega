@@ -16,6 +16,8 @@ from typing import Any
 
 import torch
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.load_fn import load_and_preprocess_images
 
