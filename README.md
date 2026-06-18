@@ -140,15 +140,17 @@ python scripts/profile_multi_device_inference.py \
 Available modes are:
 
 - `single`: current single-GPU inference.
-- `dataparallel`: confirms PyTorch `DataParallel` does not shard the usual
-  native video input because VGGT-Omega uses batch size 1 with frames on axis 1.
 - `fsdp`: emits a single-process finding unless launched with
   `torchrun --nproc_per_node=N`; use it to measure parameter sharding separately.
-- `head-parallel`: experimental exact-attention prototype that splits attention
-  heads across devices for aggregator inter-frame blocks and the camera-head
-  trunk.
-- `compare`: runs `single` and `head-parallel`, then reports shape and drift for
-  `pose_enc`, `depth`, `depth_conf`, and `camera_and_register_tokens`.
+- `projected-head-parallel`: experimental all-frame attention prototype that
+  shards QKV output channels by attention-head range for aggregator inter-frame
+  blocks and the camera-head trunk, applies matching output-projection column
+  slices per shard, then sums projected partials on the primary GPU.
+- `compare`: runs `single` and `projected-head-parallel`, then reports finite
+  diagnostics, shape, and drift for `pose_enc`, `depth`, `depth_conf`, and
+  `camera_and_register_tokens`.
+- `capacity`: runs `single` or `projected-head-parallel` over a comma-separated
+  `--frame-counts` list and stops at the first CUDA OOM.
 
 ## License
 

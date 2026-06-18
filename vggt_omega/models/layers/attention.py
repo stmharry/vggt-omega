@@ -79,25 +79,25 @@ class SelfAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim, bias=proj_bias, device=device)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.head_parallel_devices: tuple[torch.device, ...] = ()
+        self.projected_head_parallel_devices: tuple[torch.device, ...] = ()
 
-    def set_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
+    def set_projected_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
         if devices is None:
-            self.head_parallel_devices = ()
+            self.projected_head_parallel_devices = ()
             return
         parsed_devices = tuple(torch.device(device) for device in devices)
         if len(parsed_devices) <= 1:
-            self.head_parallel_devices = ()
+            self.projected_head_parallel_devices = ()
             return
         if self.num_heads % len(parsed_devices) != 0:
             raise ValueError(
-                "Head-parallel attention requires the number of attention heads "
+                "Projected head-parallel attention requires the number of attention heads "
                 f"({self.num_heads}) to be divisible by the device count ({len(parsed_devices)})."
             )
         for device in parsed_devices:
             if device.type != "cuda":
-                raise ValueError(f"Head-parallel attention requires CUDA devices, got {device}.")
-        self.head_parallel_devices = parsed_devices
+                raise ValueError(f"Projected head-parallel attention requires CUDA devices, got {device}.")
+        self.projected_head_parallel_devices = parsed_devices
 
     def apply_rope(self, q: Tensor, k: Tensor, rope: Tensor | Tuple[Tensor, Tensor]) -> Tuple[Tensor, Tensor]:
         # All operations will use the dtype of rope, the output is cast back to the dtype of q and k
@@ -121,6 +121,12 @@ class SelfAttention(nn.Module):
         return q, k
 
     def forward(self, x: Tensor, attn_bias=None, rope: Tensor = None) -> Tensor:
+        if self.projected_head_parallel_devices:
+            if attn_bias is not None:
+                raise ValueError("Projected head-parallel attention does not support attn_bias.")
+            if rope is not None:
+                raise ValueError("Projected head-parallel attention is only enabled for non-RoPE all-frame blocks.")
+            return self.forward_projected_head_parallel(x)
         qkv = self.qkv(x)
         attn_v = self.compute_attention(qkv=qkv, attn_bias=attn_bias, rope=rope)
         x = self.proj(attn_v)
@@ -129,6 +135,12 @@ class SelfAttention(nn.Module):
 
     def forward_list(self, x_list, attn_bias=None, rope_list=None) -> List[Tensor]:
         assert len(x_list) == len(rope_list)  # should be enforced by the Block
+        if self.projected_head_parallel_devices:
+            if attn_bias is not None:
+                raise ValueError("Projected head-parallel attention does not support attn_bias.")
+            if any(rope is not None for rope in rope_list):
+                raise ValueError("Projected head-parallel attention is only enabled for non-RoPE all-frame blocks.")
+            return [self.forward_projected_head_parallel(x) for x in x_list]
         x_flat, shapes, num_tokens = cat_keep_shapes(x_list)
         qkv_flat = self.qkv(x_flat)
         qkv_list = uncat_with_shapes(qkv_flat, shapes, num_tokens)
@@ -152,45 +164,76 @@ class SelfAttention(nn.Module):
             k = self.k_norm(k)
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
-        if self.head_parallel_devices:
-            x = self.compute_head_parallel_attention(q, k, v)
-        else:
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2)
         return x.reshape([B, N, C])
 
-    def compute_head_parallel_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
-        source_device = q.device
-        chunks = len(self.head_parallel_devices)
-        q_chunks = torch.chunk(q, chunks, dim=1)
-        k_chunks = torch.chunk(k, chunks, dim=1)
-        v_chunks = torch.chunk(v, chunks, dim=1)
-        outputs: list[Tensor] = []
-        streams = [
-            torch.cuda.Stream(device=device)
-            for device in self.head_parallel_devices
-        ]
-        for device, stream, q_chunk, k_chunk, v_chunk in zip(
-            self.head_parallel_devices,
-            streams,
-            q_chunks,
-            k_chunks,
-            v_chunks,
-        ):
-            with torch.cuda.device(device), torch.cuda.stream(stream):
-                q_device = q_chunk.to(device=device, non_blocking=True)
-                k_device = k_chunk.to(device=device, non_blocking=True)
-                v_device = v_chunk.to(device=device, non_blocking=True)
-                output = torch.nn.functional.scaled_dot_product_attention(
-                    q_device,
-                    k_device,
-                    v_device,
+    def forward_projected_head_parallel(self, x: Tensor) -> Tensor:
+        source_device = x.device
+        B, N, C = x.shape
+        head_dim = C // self.num_heads
+        heads_per_device = self.num_heads // len(self.projected_head_parallel_devices)
+        output = None
+        qkv_bias = self._effective_qkv_bias()
+
+        for shard_idx, device in enumerate(self.projected_head_parallel_devices):
+            head_start = shard_idx * heads_per_device
+            head_end = head_start + heads_per_device
+            column_start = head_start * head_dim
+            column_end = head_end * head_dim
+
+            q_rows = torch.arange(column_start, column_end, device=self.qkv.weight.device)
+            k_rows = torch.arange(C + column_start, C + column_end, device=self.qkv.weight.device)
+            v_rows = torch.arange(2 * C + column_start, 2 * C + column_end, device=self.qkv.weight.device)
+            rows = torch.cat([q_rows, k_rows, v_rows])
+
+            x_device = x.to(device=device, non_blocking=True)
+            qkv_weight = self.qkv.weight.index_select(0, rows).to(device=device, non_blocking=True)
+            if qkv_bias is None:
+                shard_bias = None
+            else:
+                shard_bias = qkv_bias.index_select(0, rows).to(device=device, non_blocking=True)
+
+            qkv = F.linear(x_device, qkv_weight, shard_bias)
+            qkv = qkv.reshape(B, N, 3, heads_per_device, head_dim)
+            q, k, v = torch.unbind(qkv, 2)
+            q, k, v = [tensor.transpose(1, 2) for tensor in [q, k, v]]
+
+            if self.use_qk_norm:
+                q = F.layer_norm(
+                    q,
+                    (head_dim,),
+                    self.q_norm.weight.to(device=device, dtype=q.dtype, non_blocking=True),
+                    self.q_norm.bias.to(device=device, dtype=q.dtype, non_blocking=True),
+                    self.q_norm.eps,
                 )
-                outputs.append(output.to(device=source_device, non_blocking=True))
-        for device, stream in zip(self.head_parallel_devices, streams):
-            with torch.cuda.device(device):
-                stream.synchronize()
-        return torch.cat(outputs, dim=1)
+                k = F.layer_norm(
+                    k,
+                    (head_dim,),
+                    self.k_norm.weight.to(device=device, dtype=k.dtype, non_blocking=True),
+                    self.k_norm.bias.to(device=device, dtype=k.dtype, non_blocking=True),
+                    self.k_norm.eps,
+                )
+
+            attn_v = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            attn_v = attn_v.transpose(1, 2).reshape(B, N, column_end - column_start)
+            proj_weight = self.proj.weight[:, column_start:column_end].to(device=device, non_blocking=True)
+            partial = F.linear(attn_v, proj_weight, None).to(device=source_device, non_blocking=True)
+            output = partial if output is None else output + partial
+
+        if output is None:
+            raise RuntimeError("Projected head-parallel attention has no configured devices.")
+        if self.proj.bias is not None:
+            output = output + self.proj.bias.to(device=source_device, dtype=output.dtype)
+        return self.proj_drop(output)
+
+    def _effective_qkv_bias(self) -> Tensor | None:
+        if self.qkv.bias is None:
+            return None
+        bias_mask = getattr(self.qkv, "bias_mask", None)
+        if bias_mask is None:
+            return self.qkv.bias
+        return self.qkv.bias * bias_mask.to(dtype=self.qkv.bias.dtype)
 
 
 class CausalSelfAttention(nn.Module):
