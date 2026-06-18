@@ -99,12 +99,12 @@ class Aggregator(nn.Module):
         nn.init.normal_(self.camera_token, std=1e-3)
         nn.init.normal_(self.register_token, std=1e-3)
 
-    def set_inter_frame_projected_head_parallel_devices(
+    def set_inter_frame_head_parallel_devices(
         self,
         devices: Sequence[str | torch.device] | None,
     ) -> None:
         for block in self.inter_frame_blocks:
-            block.set_projected_head_parallel_devices(devices)
+            block.set_head_parallel_devices(devices)
 
     def forward(
         self,

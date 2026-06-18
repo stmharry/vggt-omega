@@ -33,9 +33,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("single", "projected-head-parallel", "fsdp", "compare", "capacity"),
+        choices=("single", "head-parallel", "fsdp", "compare", "capacity"),
         default="single",
-        help="Inference path to profile. compare runs single and projected-head-parallel sequentially.",
+        help="Inference path to profile. compare runs single and head-parallel sequentially.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -106,8 +106,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--capacity-mode",
-        choices=("single", "projected-head-parallel"),
-        default="projected-head-parallel",
+        choices=("single", "head-parallel"),
+        default="head-parallel",
         help="Inference path used by capacity mode.",
     )
     parser.add_argument(
@@ -265,14 +265,14 @@ def run_single(
     }
 
 
-def run_projected_head_parallel(
+def run_head_parallel(
     args: argparse.Namespace,
     images: torch.Tensor,
     devices: list[torch.device],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     primary_device = devices[0]
     model = load_model(args, primary_device)
-    model.enable_projected_head_parallelism(devices)
+    model.enable_head_parallelism(devices)
     reset_memory_stats(devices)
     start = time.perf_counter()
     with torch.inference_mode():
@@ -280,12 +280,12 @@ def run_projected_head_parallel(
     synchronize(devices)
     elapsed = time.perf_counter() - start
     return outputs, {
-        "mode": "projected-head-parallel",
+        "mode": "head-parallel",
         "status": "completed",
         "finding": (
-            "Aggregator inter-frame blocks and the camera-head trunk shard QKV output "
-            "channels by attention-head range before SDPA, apply matching output-projection "
-            "column slices per shard, then sum partial projected outputs on the primary device."
+            "Aggregator inter-frame blocks and the camera-head trunk split already-projected "
+            "Q/K/V tensors by attention-head range, run SDPA shards on the requested CUDA "
+            "devices, then gather heads before the native output projection on the primary device."
         ),
         "frame_count": int(images.shape[0]),
         "image_shape": list(images.shape),
@@ -422,8 +422,8 @@ def run_capacity(args: argparse.Namespace, devices: list[torch.device]) -> dict[
         try:
             if args.capacity_mode == "single":
                 _outputs, summary = run_single(args, images, devices)
-            elif args.capacity_mode == "projected-head-parallel":
-                _outputs, summary = run_projected_head_parallel(args, images, devices)
+            elif args.capacity_mode == "head-parallel":
+                _outputs, summary = run_head_parallel(args, images, devices)
             else:
                 raise AssertionError(f"Unhandled capacity mode: {args.capacity_mode}")
             summary["status"] = "completed"
@@ -478,21 +478,21 @@ def main() -> None:
     images = load_images(args, devices[0])
     if args.mode == "single":
         _outputs, summary = run_single(args, images, devices)
-    elif args.mode == "projected-head-parallel":
-        _outputs, summary = run_projected_head_parallel(args, images, devices)
+    elif args.mode == "head-parallel":
+        _outputs, summary = run_head_parallel(args, images, devices)
     elif args.mode == "compare":
         single_outputs, single_summary = run_single(args, images, devices)
         reference = cpu_outputs(single_outputs)
         del single_outputs
         torch.cuda.empty_cache()
-        parallel_outputs, parallel_summary = run_projected_head_parallel(args, images, devices)
+        parallel_outputs, parallel_summary = run_head_parallel(args, images, devices)
         candidate = cpu_outputs(parallel_outputs)
         parity = compare_outputs(reference, candidate, args.parity_atol, args.parity_rtol)
         summary = {
             "mode": "compare",
             "status": "passed" if parity_passed(parity) else "failed",
             "single": single_summary,
-            "projected_head_parallel": parallel_summary,
+            "head_parallel": parallel_summary,
             "parity": parity,
         }
     else:

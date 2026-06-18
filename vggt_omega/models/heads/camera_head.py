@@ -44,9 +44,9 @@ class CameraHead(nn.Module):
             nn.Linear(dim_in // 2, 9, bias=True),
         )
 
-    def set_projected_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
+    def set_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
         for block in self.trunk:
-            block.set_projected_head_parallel_devices(devices)
+            block.set_head_parallel_devices(devices)
 
     def forward(
         self,

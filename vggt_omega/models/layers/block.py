@@ -72,10 +72,10 @@ class SelfAttentionBlock(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def set_projected_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
-        setter = getattr(self.attn, "set_projected_head_parallel_devices", None)
+    def set_head_parallel_devices(self, devices: Sequence[str | torch.device] | None) -> None:
+        setter = getattr(self.attn, "set_head_parallel_devices", None)
         if setter is None:
-            raise TypeError(f"{type(self.attn).__name__} does not support projected head-parallel devices.")
+            raise TypeError(f"{type(self.attn).__name__} does not support head-parallel devices.")
         setter(devices)
 
     @staticmethod

@@ -33,15 +33,15 @@ class VGGTOmega(nn.Module):
         self.dense_head = DenseHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_depth else None
         self.text_alignment_head = TextAlignmentHead(dim_in=2 * embed_dim) if enable_alignment else None
 
-    def enable_projected_head_parallelism(
+    def enable_head_parallelism(
         self,
         devices: Sequence[str | torch.device],
         *,
         include_camera_head: bool = True,
     ) -> None:
-        self.aggregator.set_inter_frame_projected_head_parallel_devices(devices)
+        self.aggregator.set_inter_frame_head_parallel_devices(devices)
         if include_camera_head and self.camera_head is not None:
-            self.camera_head.set_projected_head_parallel_devices(devices)
+            self.camera_head.set_head_parallel_devices(devices)
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
         if len(images.shape) == 4:
