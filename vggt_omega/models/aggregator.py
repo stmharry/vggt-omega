@@ -209,6 +209,7 @@ class Aggregator(nn.Module):
                     frame_rope[0].to(device=stage_device, non_blocking=True),
                     frame_rope[1].to(device=stage_device, non_blocking=True),
                 )
+            should_cache_layer = block_idx in self.cached_layer_indices
             tokens, frame_tokens = self._run_frame_block(
                 tokens,
                 batch_size,
@@ -217,6 +218,7 @@ class Aggregator(nn.Module):
                 embed_dim,
                 block_idx,
                 frame_rope,
+                return_frame_tokens=should_cache_layer,
             )
             tokens = self._run_inter_frame_attention_block(
                 tokens,
@@ -227,7 +229,9 @@ class Aggregator(nn.Module):
                 block_idx,
                 self.inter_frame_attention_types[block_idx],
             )
-            if block_idx in self.cached_layer_indices:
+            if should_cache_layer:
+                if frame_tokens is None:
+                    raise RuntimeError(f"Expected cached frame tokens for block {block_idx}")
                 cached_tokens = torch.cat([frame_tokens, tokens], dim=-1)
                 if self.cache_device is not None:
                     cached_tokens = cached_tokens.to(
@@ -280,9 +284,13 @@ class Aggregator(nn.Module):
         embed_dim: int,
         block_idx: int,
         rope_sincos: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        return_frame_tokens: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         tokens = tokens.view(batch_size * num_frames, num_tokens, embed_dim)
         tokens = self.frame_blocks[block_idx](tokens, rope_sincos)
+        if not return_frame_tokens:
+            return tokens, None
         return tokens, tokens.view(batch_size, num_frames, num_tokens, embed_dim)
 
     def _run_inter_frame_attention_block(
